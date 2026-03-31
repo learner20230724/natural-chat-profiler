@@ -4,6 +4,13 @@ export type ReasonerJobStatus = 'pending' | 'running' | 'completed' | 'failed';
 export type ReasonerTriggerType = 'message_threshold' | 'timer' | 'manual';
 export type RevisionSource = 'reasoner' | 'manual' | 'system';
 
+export interface ProfileFieldDefinition {
+  key: string;
+  label: string;
+  placeholder?: string | null;
+  promptHint?: string | null;
+}
+
 export interface ReasoningStep {
   reasoningText: string | null;
   finalOutputText: string | null;
@@ -11,6 +18,8 @@ export interface ReasoningStep {
   triggerType?: ReasonerTriggerType | 'manual_edit';
   source?: RevisionSource | 'streaming';
 }
+
+export type MessageUiStatus = 'queued' | 'streaming' | 'cancelled' | 'error';
 
 export interface Message {
   id: string;
@@ -20,15 +29,12 @@ export interface Message {
   sequenceNo?: number;
   modelName?: string | null;
   streamCompleted?: boolean;
+  uiStatus?: MessageUiStatus;
 }
 
 export interface ProfileData {
   sessionId?: string;
-  age: string | null;
-  hometown: string | null;
-  currentCity: string | null;
-  personality: string | null;
-  expectations: string | null;
+  values: Record<string, string | null>;
   reasoning: string | null;
   reasoningHistory: ReasoningStep[];
   currentReasoningDraft: string | null;
@@ -76,12 +82,14 @@ export interface Session {
   isMinorFlagged: boolean;
   privacyClearedAt: Date | null;
   preview: string;
+  profileFieldDefinitions: ProfileFieldDefinition[];
 }
 
 export interface SessionDetail {
   session: Session;
   messages: Message[];
   profile: ProfileData | null;
+  profileFieldDefinitions: ProfileFieldDefinition[];
 }
 
 export interface ApiError {
@@ -97,11 +105,23 @@ export interface ApiResponse<T> {
   meta?: Record<string, unknown>;
 }
 
+export interface LoadingState {
+  sessions: boolean;
+  sessionDetail: boolean;
+  creatingSession: boolean;
+  deletingSessionId: string | null;
+  clearingAllData: boolean;
+  exportingPdf: boolean;
+  analyzingProfile: boolean;
+}
+
 export interface AppState {
   currentSessionId: string | null;
   sessions: Session[];
   messages: Message[];
   profileData: ProfileData;
+  profileFieldDefinitions: ProfileFieldDefinition[];
+  loading: LoadingState;
   isLoading: boolean;
   isStreaming: boolean;
   activeStreamCount: number;

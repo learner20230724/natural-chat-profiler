@@ -5,6 +5,13 @@ export type ReasonerJobStatus = 'pending' | 'running' | 'completed' | 'failed';
 export type RevisionSource = 'reasoner' | 'manual' | 'system';
 export type PrivacyEventType = 'clear_session' | 'clear_all' | 'export_pdf';
 
+export interface ProfileFieldDefinition {
+  key: string;
+  label: string;
+  placeholder?: string | null;
+  promptHint?: string | null;
+}
+
 export interface Message {
   id: string;
   role: MessageRole;
@@ -24,6 +31,8 @@ export interface SessionRecord {
   profileVersion: number;
   isMinorFlagged: boolean;
   privacyClearedAt: Date | null;
+  isInitializing: boolean;
+  profileFieldDefinitions: ProfileFieldDefinition[];
 }
 
 export interface SessionListItem extends SessionRecord {
@@ -43,11 +52,7 @@ export interface SessionMessageRecord {
 
 export interface ProfileSnapshot {
   sessionId: string;
-  age: string | null;
-  hometown: string | null;
-  currentCity: string | null;
-  personality: string | null;
-  expectations: string | null;
+  values: Record<string, string | null>;
   confidence: Record<string, number> | null;
   reasoningSummary: string | null;
   updatedAt: Date;
@@ -98,6 +103,7 @@ export interface SessionDetail {
   session: SessionRecord;
   messages: SessionMessageRecord[];
   profile: ProfileSnapshot | null;
+  profileFieldDefinitions: ProfileFieldDefinition[];
 }
 
 export interface ReasoningStep {

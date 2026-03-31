@@ -15,14 +15,9 @@ export class SessionTitleService {
       .join('\n');
 
     const profileSummary = profile
-      ? [
-          profile.age ? `年龄: ${profile.age}` : null,
-          profile.hometown ? `家乡: ${profile.hometown}` : null,
-          profile.currentCity ? `现居地: ${profile.currentCity}` : null,
-          profile.personality ? `性格: ${profile.personality}` : null,
-          profile.expectations ? `期待: ${profile.expectations}` : null,
-        ]
-          .filter(Boolean)
+      ? Object.values(profile.values || {})
+          .filter((value) => value)
+          .map((value, index) => `信息${index + 1}: ${value}`)
           .join('\n')
       : '';
 

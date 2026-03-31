@@ -1,11 +1,15 @@
 import { AIMessage } from '../infrastructure/ai/DeepSeekClient';
-import { ProfileSnapshot, SessionMessageRecord } from '../types';
+import { ProfileFieldDefinition, ProfileSnapshot, SessionMessageRecord } from '../types';
 
-export function buildChatPrompt(messages: SessionMessageRecord[], profile: ProfileSnapshot | null): AIMessage[] {
+export function buildChatPrompt(
+  messages: SessionMessageRecord[],
+  profile: ProfileSnapshot | null,
+  profileFields: ProfileFieldDefinition[]
+): AIMessage[] {
   return [
     {
       role: 'system',
-      content: createChatSystemPrompt(profile),
+      content: createChatSystemPrompt(profile, profileFields),
     },
     ...messages.map((message) => ({
       role: message.role,
@@ -14,20 +18,21 @@ export function buildChatPrompt(messages: SessionMessageRecord[], profile: Profi
   ];
 }
 
-function createChatSystemPrompt(profile: ProfileSnapshot | null) {
+function createChatSystemPrompt(profile: ProfileSnapshot | null, profileFields: ProfileFieldDefinition[]) {
   const missingInfo: string[] = [];
   const collectedInfo: string[] = [];
 
-  if (!profile?.age) missingInfo.push('年龄');
-  else collectedInfo.push(`年龄：${profile.age}`);
-  if (!profile?.hometown) missingInfo.push('家庭所在城市');
-  else collectedInfo.push(`家庭所在城市：${profile.hometown}`);
-  if (!profile?.currentCity) missingInfo.push('现居城市');
-  else collectedInfo.push(`现居城市：${profile.currentCity}`);
-  if (!profile?.personality) missingInfo.push('性格特征');
-  else collectedInfo.push(`性格特征：${profile.personality}`);
-  if (!profile?.expectations) missingInfo.push('期待的对象特征');
-  else collectedInfo.push(`期待的对象特征：${profile.expectations}`);
+  const values = profile?.values ?? {};
+  profileFields.forEach((field) => {
+    const value = values[field.key];
+    if (!value) {
+      missingInfo.push(field.label);
+    } else {
+      collectedInfo.push(`${field.label}：${value}`);
+    }
+  });
+
+  const fieldLabels = profileFields.map((field) => field.label).join('\n');
 
   return `你是一个善于聊天的 AI 伙伴。
 你知道自己是 AI，不会假装成真实人类，但你的表达自然、轻松，像朋友聊天，而不是客服或问卷调查。
@@ -36,11 +41,7 @@ function createChatSystemPrompt(profile: ProfileSnapshot | null) {
 
 需要了解的信息包括：
 
-年龄
-家庭所在城市
-现居城市
-性格特征
-期待的对象特征
+${fieldLabels}
 
 这些信息一开始都是未知的，你需要在对话过程中慢慢了解，而不是直接逐条提问。
 

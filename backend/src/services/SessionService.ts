@@ -5,6 +5,9 @@ import { ProfileRepository } from '../infrastructure/repositories/ProfileReposit
 import { PrivacyEventRepository } from '../infrastructure/repositories/PrivacyEventRepository';
 import { SessionTitleService } from './SessionTitleService';
 import { NotFoundError } from '../shared/errors';
+import { ProfileFieldDefinition } from '../types';
+
+const AUTO_DELETE_EMPTY_SESSION_GRACE_MS = 60 * 1000;
 
 export class SessionService {
   constructor(
@@ -43,9 +46,13 @@ export class SessionService {
     ]);
 
     return {
-      session,
+      session: {
+        ...session,
+        preview: buildSessionPreview(session),
+      },
       messages,
       profile,
+      profileFieldDefinitions: session.profileFieldDefinitions,
     };
   }
 
@@ -58,16 +65,16 @@ export class SessionService {
     await this.privacyEvents.create({
       sessionId,
       eventType: 'clear_session',
-      metadata: { scope: 'single_session' },
+      metadata: { scope: 'single_session', deletionMode: 'soft' },
     });
-    await this.sessions.hardDelete(sessionId);
+    await this.sessions.clearPrivacyData(sessionId);
   }
 
   async clearAllData() {
     await this.privacyEvents.create({
       sessionId: null,
       eventType: 'clear_all',
-      metadata: { scope: 'all_sessions' },
+      metadata: { scope: 'all_sessions', deletionMode: 'hard' },
     });
     await this.sessions.clearAll();
   }
@@ -110,7 +117,16 @@ export class SessionService {
         this.profiles.findBySessionId(session.id),
       ]);
 
+      if (session.isInitializing) {
+        continue;
+      }
+
       if (messages.length === 0) {
+        const isRecentEmptySession = Date.now() - session.createdAt.getTime() < AUTO_DELETE_EMPTY_SESSION_GRACE_MS;
+        if (isRecentEmptySession) {
+          continue;
+        }
+
         await this.sessions.hardDelete(session.id);
         deletedCount += 1;
         continue;
@@ -135,6 +151,25 @@ export class SessionService {
       deletedCount,
       renamedCount,
     };
+  }
+
+  async getProfileFieldDefinitions(sessionId: string) {
+    const session = await this.sessions.findById(sessionId);
+    if (!session) {
+      throw new NotFoundError('Session not found');
+    }
+
+    return session.profileFieldDefinitions;
+  }
+
+  async updateProfileFieldDefinitions(sessionId: string, definitions: ProfileFieldDefinition[]) {
+    const session = await this.sessions.findById(sessionId);
+    if (!session) {
+      throw new NotFoundError('Session not found');
+    }
+
+    await this.sessions.updateProfileFields(sessionId, definitions);
+    return definitions;
   }
 }
 

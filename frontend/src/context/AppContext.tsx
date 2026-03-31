@@ -4,10 +4,12 @@ import type {
   Session,
   Message,
   ProfileData,
+  ProfileFieldDefinition,
+  LoadingState,
 } from '../types';
 
 type AppAction =
-  | { type: 'SET_LOADING'; payload: boolean }
+  | { type: 'SET_LOADING'; payload: Partial<LoadingState> }
   | { type: 'START_STREAMING' }
   | { type: 'COMPLETE_STREAMING' }
   | { type: 'SET_ERROR'; payload: string | null }
@@ -17,21 +19,21 @@ type AppAction =
   | { type: 'REMOVE_SESSION'; payload: string }
   | { type: 'SET_MESSAGES'; payload: Message[] }
   | { type: 'ADD_MESSAGE'; payload: Message }
+  | { type: 'UPDATE_MESSAGE'; payload: { messageId: string; updates: Partial<Message> } }
+  | { type: 'REMOVE_MESSAGES'; payload: string[] }
   | { type: 'APPEND_MESSAGE_CONTENT'; payload: { messageId: string; chunk: string } }
   | { type: 'START_PROFILE_REASONING' }
   | { type: 'UPDATE_PROFILE_REASONING'; payload: string }
   | { type: 'COMPLETE_PROFILE_REASONING'; payload?: string | null; reasoning?: string | null }
   | { type: 'SET_PROFILE_DATA'; payload: ProfileData | null }
   | { type: 'MERGE_PROFILE_DATA'; payload: Partial<ProfileData> | null }
+  | { type: 'SET_PROFILE_FIELDS'; payload: ProfileFieldDefinition[] }
+  | { type: 'MERGE_PROFILE_FIELDS'; payload: ProfileFieldDefinition[] }
   | { type: 'RESET_SESSION' };
 
 const emptyProfile: ProfileData = {
   sessionId: undefined,
-  age: null,
-  hometown: null,
-  currentCity: null,
-  personality: null,
-  expectations: null,
+  values: {},
   reasoning: null,
   reasoningHistory: [],
   currentReasoningDraft: null,
@@ -46,6 +48,16 @@ const initialState: AppState = {
   sessions: [],
   messages: [],
   profileData: emptyProfile,
+  profileFieldDefinitions: [],
+  loading: {
+    sessions: false,
+    sessionDetail: false,
+    creatingSession: false,
+    deletingSessionId: null,
+    clearingAllData: false,
+    exportingPdf: false,
+    analyzingProfile: false,
+  },
   isLoading: false,
   isStreaming: false,
   activeStreamCount: 0,
@@ -54,8 +66,16 @@ const initialState: AppState = {
 
 function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
-    case 'SET_LOADING':
-      return { ...state, isLoading: action.payload };
+    case 'SET_LOADING': {
+      const nextLoading = {
+        ...state.loading,
+        ...action.payload,
+      };
+      const isLoading = Object.values(nextLoading).some((value) =>
+        typeof value === 'boolean' ? value : value !== null
+      );
+      return { ...state, loading: nextLoading, isLoading };
+    }
     case 'START_STREAMING': {
       const nextActiveStreamCount = state.activeStreamCount + 1;
       return {
@@ -88,6 +108,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
         currentSessionId: isCurrentSession ? null : state.currentSessionId,
         messages: isCurrentSession ? [] : state.messages,
         profileData: isCurrentSession ? emptyProfile : state.profileData,
+        profileFieldDefinitions: isCurrentSession ? [] : state.profileFieldDefinitions,
         isStreaming: isCurrentSession ? false : state.isStreaming,
         activeStreamCount: isCurrentSession ? 0 : state.activeStreamCount,
       };
@@ -96,12 +117,29 @@ function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, messages: action.payload };
     case 'ADD_MESSAGE':
       return { ...state, messages: [...state.messages, action.payload] };
+    case 'UPDATE_MESSAGE':
+      return {
+        ...state,
+        messages: state.messages.map((message) =>
+          message.id === action.payload.messageId
+            ? { ...message, ...action.payload.updates }
+            : message
+        ),
+      };
+    case 'REMOVE_MESSAGES':
+      return {
+        ...state,
+        messages: state.messages.filter((message) => !action.payload.includes(message.id)),
+      };
     case 'APPEND_MESSAGE_CONTENT':
       return {
         ...state,
         messages: state.messages.map((message) =>
           message.id === action.payload.messageId
-            ? { ...message, content: message.content + action.payload.chunk }
+            ? {
+                ...message,
+                content: message.content + action.payload.chunk,
+              }
             : message
         ),
       };
@@ -124,7 +162,6 @@ function appReducer(state: AppState, action: AppAction): AppState {
         },
       };
     case 'COMPLETE_PROFILE_REASONING': {
-      // 优先使用 SSE 事件中传入的完整 reasoningText，否则使用流式传输累积的
       const currentReasoning = action.reasoning ?? state.profileData.reasoning;
       const finalOutputText = action.payload ?? null;
       const nextHistory = currentReasoning || finalOutputText
@@ -148,6 +185,16 @@ function appReducer(state: AppState, action: AppAction): AppState {
         },
       };
     }
+    case 'SET_PROFILE_FIELDS':
+      return {
+        ...state,
+        profileFieldDefinitions: action.payload,
+      };
+    case 'MERGE_PROFILE_FIELDS':
+      return {
+        ...state,
+        profileFieldDefinitions: action.payload,
+      };
     case 'SET_PROFILE_DATA':
       return {
         ...state,
@@ -163,6 +210,9 @@ function appReducer(state: AppState, action: AppAction): AppState {
         profileData: {
           ...state.profileData,
           ...action.payload,
+          values: action.payload.values
+            ? { ...state.profileData.values, ...action.payload.values }
+            : state.profileData.values,
           reasoningHistory: state.profileData.reasoningHistory,
           currentReasoningDraft: state.profileData.currentReasoningDraft,
           currentFinalDraft: state.profileData.currentFinalDraft,
@@ -175,6 +225,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
         ...state,
         messages: [],
         profileData: emptyProfile,
+        profileFieldDefinitions: [],
         isStreaming: false,
         activeStreamCount: 0,
       };
@@ -183,10 +234,9 @@ function appReducer(state: AppState, action: AppAction): AppState {
   }
 }
 
-interface AppContextType {
+interface AppContextValue {
   state: AppState;
-  dispatch: React.Dispatch<AppAction>;
-  setLoading: (loading: boolean) => void;
+  setLoading: (loading: Partial<LoadingState>) => void;
   startStreaming: () => void;
   completeStreaming: () => void;
   setError: (error: string | null) => void;
@@ -196,21 +246,25 @@ interface AppContextType {
   removeSession: (sessionId: string) => void;
   setMessages: (messages: Message[]) => void;
   addMessage: (message: Message) => void;
+  updateMessage: (messageId: string, updates: Partial<Message>) => void;
+  removeMessages: (messageIds: string[]) => void;
   appendMessageContent: (messageId: string, chunk: string) => void;
   startProfileReasoning: () => void;
   updateProfileReasoning: (chunk: string) => void;
   completeProfileReasoning: (finalOutputText?: string | null, reasoningText?: string | null) => void;
   setProfileData: (profileData: ProfileData | null) => void;
   mergeProfileData: (profileData: Partial<ProfileData> | null) => void;
+  setProfileFields: (definitions: ProfileFieldDefinition[]) => void;
+  mergeProfileFields: (definitions: ProfileFieldDefinition[]) => void;
   resetSession: () => void;
 }
 
-const AppContext = createContext<AppContextType | undefined>(undefined);
+const AppContext = createContext<AppContextValue | undefined>(undefined);
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [state, dispatch] = useReducer(appReducer, initialState);
 
-  const setLoading = useCallback((loading: boolean) => {
+  const setLoading = useCallback((loading: Partial<LoadingState>) => {
     dispatch({ type: 'SET_LOADING', payload: loading });
   }, []);
 
@@ -250,6 +304,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     dispatch({ type: 'ADD_MESSAGE', payload: message });
   }, []);
 
+  const updateMessage = useCallback((messageId: string, updates: Partial<Message>) => {
+    dispatch({ type: 'UPDATE_MESSAGE', payload: { messageId, updates } });
+  }, []);
+
+  const removeMessages = useCallback((messageIds: string[]) => {
+    dispatch({ type: 'REMOVE_MESSAGES', payload: messageIds });
+  }, []);
+
   const appendMessageContent = useCallback((messageId: string, chunk: string) => {
     dispatch({ type: 'APPEND_MESSAGE_CONTENT', payload: { messageId, chunk } });
   }, []);
@@ -263,26 +325,37 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const completeProfileReasoning = useCallback((finalOutputText?: string | null, reasoningText?: string | null) => {
-    dispatch({ type: 'COMPLETE_PROFILE_REASONING', payload: finalOutputText, reasoning: reasoningText });
+    dispatch({
+      type: 'COMPLETE_PROFILE_REASONING',
+      payload: finalOutputText,
+      reasoning: reasoningText,
+    });
   }, []);
 
   const setProfileData = useCallback((profileData: ProfileData | null) => {
     dispatch({ type: 'SET_PROFILE_DATA', payload: profileData });
   }, []);
 
-  const resetSession = useCallback(() => {
-    dispatch({ type: 'RESET_SESSION' });
-  }, []);
-
   const mergeProfileData = useCallback((profileData: Partial<ProfileData> | null) => {
     dispatch({ type: 'MERGE_PROFILE_DATA', payload: profileData });
+  }, []);
+
+  const setProfileFields = useCallback((definitions: ProfileFieldDefinition[]) => {
+    dispatch({ type: 'SET_PROFILE_FIELDS', payload: definitions });
+  }, []);
+
+  const mergeProfileFields = useCallback((definitions: ProfileFieldDefinition[]) => {
+    dispatch({ type: 'MERGE_PROFILE_FIELDS', payload: definitions });
+  }, []);
+
+  const resetSession = useCallback(() => {
+    dispatch({ type: 'RESET_SESSION' });
   }, []);
 
   return (
     <AppContext.Provider
       value={{
         state,
-        dispatch,
         setLoading,
         startStreaming,
         completeStreaming,
@@ -293,12 +366,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         removeSession,
         setMessages,
         addMessage,
+        updateMessage,
+        removeMessages,
         appendMessageContent,
         startProfileReasoning,
         updateProfileReasoning,
         completeProfileReasoning,
         setProfileData,
         mergeProfileData,
+        setProfileFields,
+        mergeProfileFields,
         resetSession,
       }}
     >
@@ -309,8 +386,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
 export function useAppContext() {
   const context = useContext(AppContext);
+
   if (!context) {
     throw new Error('useAppContext must be used within an AppProvider');
   }
+
   return context;
 }

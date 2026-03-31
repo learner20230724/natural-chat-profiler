@@ -3,7 +3,7 @@ import { ChatService } from '../services/ChatService';
 import { ProfileService } from '../services/ProfileService';
 import { PDFService } from '../services/PDFService';
 import { createMySqlPool } from '../infrastructure/db/mysql';
-import { initializeSchema } from '../infrastructure/db/schema';
+import { initializeSchema, SchemaInitializationResult } from '../infrastructure/db/schema';
 import { SessionRepository } from '../infrastructure/repositories/SessionRepository';
 import { MessageRepository } from '../infrastructure/repositories/MessageRepository';
 import { ProfileRepository } from '../infrastructure/repositories/ProfileRepository';
@@ -15,7 +15,7 @@ import { SessionTitleService } from '../services/SessionTitleService';
 export interface AppContainer {
   db: {
     pool: ReturnType<typeof createMySqlPool>;
-    initializeSchema: () => Promise<void>;
+    initializeSchema: () => Promise<SchemaInitializationResult>;
   };
   repositories: {
     sessions: SessionRepository;
@@ -56,8 +56,8 @@ export function createContainer(): AppContainer {
     },
     services: {
       sessionService: new SessionService(sessions, messages, profiles, privacyEvents, titleService),
-      chatService: new ChatService(sessions, messages, profiles, aiClient),
-      profileService: new ProfileService(sessions, messages, profiles, reasonerJobs, aiClient),
+      chatService: new ChatService(pool, sessions, messages, profiles, aiClient),
+      profileService: new ProfileService(pool, sessions, messages, profiles, reasonerJobs, aiClient),
       pdfService: new PDFService(),
     },
   };

@@ -17,13 +17,37 @@ export default function createChatRouter(chatService: ChatService, profileServic
   );
 
   router.post('/:sessionId/chat', async (req, res, next) => {
+    const abortController = new AbortController();
+    const signal = abortController.signal;
+    const writeEvent = (payload: unknown) => {
+      if (signal.aborted || res.writableEnded || res.destroyed) {
+        return;
+      }
+
+      try {
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      } catch {
+        // ignore write errors on closed connections
+      }
+    };
+
+    let closed = false;
+    const onClose = () => {
+      if (closed) return;
+      closed = true;
+      abortController.abort();
+    };
+
+    req.on('aborted', onClose);
+    req.on('close', onClose);
+    res.on('close', onClose);
+    res.on('finish', onClose);
+
     try {
       const { content } = req.body as { content?: string };
       if (!content || typeof content !== 'string') {
         throw new ValidationError('Message content is required');
       }
-
-      const shouldAutoAnalyze = await profileService.shouldAutoAnalyze(req.params.sessionId);
 
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -31,44 +55,76 @@ export default function createChatRouter(chatService: ChatService, profileServic
       res.setHeader('X-Accel-Buffering', 'no');
 
       const writeEvent = (payload: unknown) => {
-        if (!res.writableEnded) {
+        if (signal.aborted || res.writableEnded || res.destroyed) {
+          return;
+        }
+
+        try {
           res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        } catch {
+          // ignore write errors on closed connections
         }
       };
 
-      await chatService.sendMessage(req.params.sessionId, content, (chunk) => {
-        writeEvent({ type: 'assistant_chunk', content: chunk });
-      });
+      await chatService.sendMessage(
+        req.params.sessionId,
+        content,
+        (chunk) => {
+          writeEvent({ type: 'assistant_chunk', content: chunk });
+        },
+        { signal }
+      );
 
-      if (shouldAutoAnalyze) {
-        writeEvent({ type: 'reasoner_started' });
-        const autoAnalysis = await profileService.maybeAnalyzeProfile(
-          req.params.sessionId,
-          (chunk) => writeEvent({ type: 'reasoner_chunk', content: chunk })
-        );
+      if (signal.aborted) {
+        return;
+      }
 
-        if (autoAnalysis) {
-          writeEvent({ type: 'profile_updated', data: autoAnalysis.profile });
-          writeEvent({
-            type: 'reasoner_completed',
-            jobId: autoAnalysis.jobId,
-            data: autoAnalysis.revision,
-            reasoningText: autoAnalysis.revision.reasoningText,
-            finalOutputText: autoAnalysis.revision.profileSnapshot.finalOutputText || autoAnalysis.revision.profileSnapshot.reasoningSummary || null
-          });
+      const autoAnalysis = await profileService.maybeAnalyzeProfile(
+        req.params.sessionId,
+        (chunk) => writeEvent({ type: 'reasoner_chunk', content: chunk }),
+        {
+          signal,
+          onStarted: () => writeEvent({ type: 'reasoner_started' }),
         }
+      );
+
+      if (signal.aborted) {
+        return;
+      }
+
+      if (autoAnalysis) {
+        writeEvent({ type: 'profile_updated', data: autoAnalysis.profile });
+        writeEvent({
+          type: 'reasoner_completed',
+          jobId: autoAnalysis.jobId,
+          data: autoAnalysis.revision,
+          reasoningText: autoAnalysis.revision.reasoningText,
+          finalOutputText:
+            autoAnalysis.revision.profileSnapshot.finalOutputText ||
+            autoAnalysis.revision.profileSnapshot.reasoningSummary ||
+            null,
+        });
+      }
+
+      if (signal.aborted) {
+        return;
       }
 
       writeEvent({ type: 'assistant_done' });
       writeEvent({ type: 'done' });
       res.end();
     } catch (error) {
+      if (signal.aborted) {
+        return;
+      }
+
       if (!res.headersSent) {
         next(error);
         return;
       }
 
-      res.write(`data: ${JSON.stringify({ type: 'error', error: error instanceof Error ? error.message : 'Failed to process message' })}\n\n`);
+      writeEvent({ type: 'error', error: error instanceof Error ? error.message : 'Failed to process message' });
+      writeEvent({ type: 'done' });
       res.end();
     }
   });

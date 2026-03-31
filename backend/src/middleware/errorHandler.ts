@@ -8,7 +8,11 @@ export function errorHandler(
   res: Response,
   next: NextFunction
 ) {
-  console.error('Error:', err);
+  console.error('[errorHandler]', {
+    name: err.name,
+    message: err.message,
+    stack: err.stack?.split('\n').slice(0, 3).join('\n') ?? null,
+  });
 
   if (res.headersSent) {
     return next(err);

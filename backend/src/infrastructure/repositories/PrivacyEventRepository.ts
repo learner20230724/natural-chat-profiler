@@ -1,15 +1,6 @@
 import { randomUUID } from 'crypto';
-import mysql from 'mysql2/promise';
 import { DatabasePool } from '../db/mysql';
 import { PrivacyEventRecord, PrivacyEventType } from '../../types';
-
-interface PrivacyEventRow extends mysql.RowDataPacket {
-  id: string;
-  session_id: string | null;
-  event_type: PrivacyEventType;
-  metadata_json: string | null;
-  created_at: Date;
-}
 
 export class PrivacyEventRepository {
   constructor(private readonly pool: DatabasePool) {}

@@ -1,21 +1,27 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useAppContext } from './context/AppContext';
 import { useApi } from './hooks/useApi';
 import {
   ChatPanel,
+  ExportButton,
+  PrivacyNotice,
   ProfilePanel,
   ReasoningPanel,
   SessionList,
-  ExportButton,
-  PrivacyNotice,
 } from './components';
+
+const MIN_INIT_DURATION_MS = 400;
 
 function App() {
   const { state, setError } = useAppContext();
   const [mobileTab, setMobileTab] = useState<'chat' | 'profile' | 'reasoning'>('chat');
   const [shouldAutoCreateSession, setShouldAutoCreateSession] = useState(true);
-  const activeStreamControllerRef = useRef<AbortController | null>(null);
+  const [isInitComplete, setIsInitComplete] = useState(false);
+  const [isMobileSessionOpen, setIsMobileSessionOpen] = useState(false);
+  const [showClearDataConfirm, setShowClearDataConfirm] = useState(false);
+  const [clearDataSuccessMessage, setClearDataSuccessMessage] = useState<string | null>(null);
   const initialCreateInFlightRef = useRef(false);
+  const activeStreamControllerRef = useRef<AbortController | null>(null);
 
   const {
     loadSessions,
@@ -25,32 +31,67 @@ function App() {
     clearAllData,
     organizeSessions,
     sendMessage,
+    abortCurrentStream,
     updateProfileField,
     exportPDF,
   } = useApi();
 
-  useEffect(() => {
-    const initApp = async () => {
-      try {
-        await organizeSessions();
-      } catch (e) {
-        // 静默忽略组织会话错误
-      }
-      try {
-        await loadSessions();
-      } catch (e) {
-        // 静默忽略加载会话错误
-      }
-    };
-    initApp();
-  }, [loadSessions, organizeSessions]);
+  const isInitialSessionLoading = state.loading.sessions || state.loading.sessionDetail;
+  const isCreatingSession = state.loading.creatingSession;
+  const isClearingAllData = state.loading.clearingAllData;
+  const isExportingPdf = state.loading.exportingPdf;
+  const deletingSessionId = state.loading.deletingSessionId;
 
   useEffect(() => {
+    let cancelled = false;
+
+    const initApp = async () => {
+      const startTime = Date.now();
+
+      try {
+        const sessions = await loadSessions();
+
+        if (!cancelled && sessions.length > 0) {
+          try {
+            await loadSession(sessions[0].id);
+          } catch {
+            // ignore auto-load failure
+          }
+        }
+      } catch {
+        // 静默忽略加载会话错误
+      }
+
+      const elapsed = Date.now() - startTime;
+      const remaining = Math.max(0, MIN_INIT_DURATION_MS - elapsed);
+      if (remaining > 0) {
+        await new Promise((resolve) => setTimeout(resolve, remaining));
+      }
+
+      if (!cancelled) {
+        setIsInitComplete(true);
+      }
+
+      void organizeSessions().catch(() => {
+        // 静默忽略组织会话错误，不阻塞首屏
+      });
+    };
+
+    void initApp();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [loadSessions, loadSession, organizeSessions]);
+
+  useEffect(() => {
+    if (!isInitComplete) return;
+
     if (
       initialCreateInFlightRef.current ||
       state.currentSessionId ||
       state.sessions.length > 0 ||
-      state.isLoading ||
+      isCreatingSession ||
       !shouldAutoCreateSession
     ) {
       return;
@@ -60,13 +101,21 @@ function App() {
     createSession()
       .catch((error) => {
         console.error('Failed to create initial session:', error);
+        setError('自动创建会话失败，请手动新建');
       })
       .finally(() => {
         initialCreateInFlightRef.current = false;
       });
-  }, [state.sessions.length, state.currentSessionId, state.isLoading, shouldAutoCreateSession, createSession]);
+  }, [
+    isInitComplete,
+    state.currentSessionId,
+    isCreatingSession,
+    state.sessions.length,
+    shouldAutoCreateSession,
+    createSession,
+    setError,
+  ]);
 
-  // 清理 active controller 当 streaming 结束
   useEffect(() => {
     if (!state.isStreaming) {
       activeStreamControllerRef.current = null;
@@ -77,9 +126,19 @@ function App() {
     if (!state.isStreaming) return true;
     const confirmed = window.confirm('当前正在生成，确定要中止并继续此操作吗？');
     if (!confirmed) return false;
-    activeStreamControllerRef.current?.abort();
+    abortCurrentStream();
     return true;
-  }, [state.isStreaming]);
+  }, [state.isStreaming, abortCurrentStream]);
+
+  const openClearDataConfirm = useCallback(async () => {
+    if (!(await confirmAbortIfStreaming())) return;
+    setShowClearDataConfirm(true);
+  }, [confirmAbortIfStreaming]);
+
+  const closeClearDataConfirm = useCallback(() => {
+    if (isClearingAllData) return;
+    setShowClearDataConfirm(false);
+  }, [isClearingAllData]);
 
   const handleSendMessage = (content: string) => {
     if (!state.currentSessionId) {
@@ -93,8 +152,11 @@ function App() {
 
   const handleSelectSession = async (sessionId: string) => {
     if (!(await confirmAbortIfStreaming())) return;
+
     try {
       await loadSession(sessionId);
+      setIsMobileSessionOpen(false);
+      setMobileTab('chat');
     } catch (error) {
       console.error('Failed to load session:', error);
       setError('加载会话失败，请重试');
@@ -103,9 +165,13 @@ function App() {
 
   const handleNewSession = async () => {
     if (!(await confirmAbortIfStreaming())) return;
+
     try {
       setShouldAutoCreateSession(true);
+      setClearDataSuccessMessage(null);
       await createSession();
+      setIsMobileSessionOpen(false);
+      setMobileTab('chat');
     } catch (error) {
       console.error('Failed to create session:', error);
       setError('创建会话失败，请重试');
@@ -114,8 +180,18 @@ function App() {
 
   const handleDeleteSession = async (sessionId: string) => {
     if (!(await confirmAbortIfStreaming())) return;
+
+    const sessionIndex = state.sessions.findIndex((session) => session.id === sessionId);
+    const fallbackSessionId =
+      state.currentSessionId === sessionId && sessionIndex !== -1
+        ? state.sessions[sessionIndex + 1]?.id ?? state.sessions[sessionIndex - 1]?.id ?? null
+        : null;
+
     try {
       await deleteSession(sessionId);
+      if (fallbackSessionId) {
+        await loadSession(fallbackSessionId);
+      }
     } catch (error) {
       console.error('Failed to delete session:', error);
       setError('删除会话失败，请重试');
@@ -131,15 +207,18 @@ function App() {
     } catch (error) {
       console.error('Failed to export PDF:', error);
       setError('导出 PDF 失败，请重试');
+      throw error;
     }
   };
 
   const handleClearAllData = async () => {
-    if (!(await confirmAbortIfStreaming())) return;
     try {
       setShouldAutoCreateSession(false);
       await clearAllData();
       await loadSessions();
+      setClearDataSuccessMessage('所有本地会话与画像数据已清除。');
+      setShowClearDataConfirm(false);
+      setIsMobileSessionOpen(false);
     } catch (error) {
       console.error('Failed to clear all data:', error);
       setError('清除数据失败，请重试');
@@ -151,6 +230,10 @@ function App() {
     setError(null);
   };
 
+  const handleDismissClearDataSuccess = () => {
+    setClearDataSuccessMessage(null);
+  };
+
   const handleUpdateProfileField = async (field: string, value: string) => {
     if (!state.currentSessionId) return;
 
@@ -158,30 +241,59 @@ function App() {
       await updateProfileField(state.currentSessionId, field, value);
     } catch (error) {
       console.error('Failed to update profile field:', error);
-      setError('更新信息失败，请重试');
+      throw error;
     }
   };
 
+  const mobileTabButtonClass = (tab: 'chat' | 'profile' | 'reasoning') =>
+    `flex-1 py-2.5 px-4 rounded-xl transition-colors ${
+      mobileTab === tab
+        ? 'bg-blue-500 text-white shadow-sm'
+        : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+    }`;
+
+  const showNoSessionHint = isInitComplete && !isInitialSessionLoading && !state.currentSessionId;
+
   return (
     <div className="h-full bg-gray-100">
-      <div className="container mx-auto h-full px-4 py-4 flex flex-col overflow-hidden max-w-[1920px]">
-        <div className="mb-4 flex-shrink-0">
-          <div className="flex items-center justify-between gap-4">
-            <h1 className="text-3xl font-bold text-gray-800">自然聊天信息提取器</h1>
+      <div className="container mx-auto h-full max-w-[1920px] overflow-hidden px-3 py-3 sm:px-4 sm:py-4 flex flex-col">
+        <div className="mb-3 flex-shrink-0 sm:mb-4">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <h1 className="text-2xl font-bold text-gray-800 sm:text-3xl">自然聊天信息提取器</h1>
+                <p className="mt-1 text-sm text-gray-500 lg:hidden">
+                  {state.currentSessionId
+                    ? '当前主任务区已就绪，可随时切换会话或查看画像。'
+                    : '先创建一个会话，开始聊天与信息提取。'}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsMobileSessionOpen(true)}
+                className="inline-flex items-center gap-2 rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-700 shadow-sm lg:hidden"
+              >
+                会话
+                <span className="rounded-full bg-blue-50 px-2 py-0.5 text-xs text-blue-600 ring-1 ring-blue-100">
+                  {state.sessions.length}
+                </span>
+              </button>
+            </div>
             <ExportButton
               sessionId={state.currentSessionId}
               onExport={handleExportPDF}
-              disabled={state.isLoading || !state.currentSessionId}
+              disabled={isExportingPdf || !state.currentSessionId}
+              compact
             />
           </div>
         </div>
 
         {state.error && (
-          <div className="mb-4 p-4 bg-red-100 text-red-700 rounded-lg flex items-center justify-between flex-shrink-0">
+          <div className="mb-4 flex flex-shrink-0 items-center justify-between rounded-lg bg-red-100 p-4 text-red-700">
             <span>错误: {state.error}</span>
             <button
               onClick={handleDismissError}
-              className="ml-4 text-red-900 hover:text-red-700 font-semibold"
+              className="ml-4 font-semibold text-red-900 hover:text-red-700"
               aria-label="关闭错误提示"
             >
               ✕
@@ -189,75 +301,88 @@ function App() {
           </div>
         )}
 
-        {state.isLoading && !state.currentSessionId && (
-          <div className="mb-4 p-4 bg-blue-100 text-blue-700 rounded-lg text-center flex-shrink-0">
-            <div className="inline-block animate-spin rounded-full h-5 w-5 border-b-2 border-blue-700 mr-2"></div>
-            加载中...
+        {clearDataSuccessMessage && (
+          <div className="mb-4 flex flex-shrink-0 items-center justify-between rounded-lg bg-green-100 p-4 text-green-700">
+            <span>{clearDataSuccessMessage}</span>
+            <button
+              onClick={handleDismissClearDataSuccess}
+ className="ml-4 font-semibold text-green-900 hover:text-green-700"
+              aria-label="关闭清除成功提示"
+            >
+              ✕
+            </button>
           </div>
         )}
 
-        <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-10 gap-3">
-          <div className="hidden lg:flex lg:col-span-2 flex-col min-h-0 gap-3">
-            <div className="flex-1 min-h-0">
+        {(isInitialSessionLoading || !isInitComplete) && !state.currentSessionId && (
+          <div className="mb-4 flex-shrink-0 rounded-lg bg-blue-100 p-4 text-center text-blue-700">
+            <div className="mr-2 inline-block h-5 w-5 animate-spin rounded-full border-b-2 border-blue-700"></div>
+            正在初始化会话列表...
+          </div>
+        )}
+
+        {showNoSessionHint && (
+          <div className="mb-4 flex-shrink-0 rounded-2xl border border-dashed border-gray-200 bg-white/80 px-4 py-3 text-sm text-gray-500 lg:hidden">
+            暂无活动会话。你可以先新建一个会话，随后在这里进行聊天、查看画像和思考过程。
+          </div>
+        )}
+
+        <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-10">
+          <div className="hidden min-h-0 flex-col gap-3 lg:col-span-2 lg:flex">
+            <div className="min-h-0 flex-1">
               <SessionList
                 sessions={state.sessions}
                 currentSessionId={state.currentSessionId}
                 onSelectSession={handleSelectSession}
                 onDeleteSession={handleDeleteSession}
                 onNewSession={handleNewSession}
-                isLoading={state.isLoading}
+                isLoading={state.loading.sessions}
+                isCreating={isCreatingSession}
+                deletingSessionId={deletingSessionId}
               />
             </div>
-            <PrivacyNotice onClearAllData={handleClearAllData} isLoading={state.isLoading} />
+            <PrivacyNotice
+              onClearAllData={openClearDataConfirm}
+              isLoading={isClearingAllData}
+              actionLabel="清除中..."
+            />
           </div>
 
-          <div className="lg:hidden col-span-1 mb-2 flex-shrink-0">
-            <div className="flex space-x-2 bg-white rounded-lg p-2 shadow">
-              <button
-                onClick={() => setMobileTab('chat')}
-                className={`flex-1 py-2 px-4 rounded transition-colors ${
-                  mobileTab === 'chat' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                }`}
-              >
+          <div className="col-span-1 mb-2 flex-shrink-0 lg:hidden">
+            <div className="flex space-x-2 rounded-2xl border border-gray-200/80 bg-white p-2 shadow-sm">
+              <button onClick={() => setMobileTab('chat')} className={mobileTabButtonClass('chat')}>
                 对话
               </button>
-              <button
-                onClick={() => setMobileTab('profile')}
-                className={`flex-1 py-2 px-4 rounded transition-colors ${
-                  mobileTab === 'profile' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                }`}
-              >
+              <button onClick={() => setMobileTab('profile')} className={mobileTabButtonClass('profile')}>
                 信息
               </button>
-              <button
-                onClick={() => setMobileTab('reasoning')}
-                className={`flex-1 py-2 px-4 rounded transition-colors ${
-                  mobileTab === 'reasoning' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                }`}
-              >
+              <button onClick={() => setMobileTab('reasoning')} className={mobileTabButtonClass('reasoning')}>
                 思考
               </button>
             </div>
           </div>
 
-          <div className="lg:col-span-3 flex flex-col min-h-0">
+          <div className={`flex min-h-0 flex-col lg:col-span-3 ${mobileTab === 'chat' ? 'block' : 'hidden'} lg:block`}>
             <ChatPanel
               sessionId={state.currentSessionId}
               messages={state.messages}
               onSendMessage={handleSendMessage}
               isStreaming={state.isStreaming}
+              onAbortStream={abortCurrentStream}
+              onCreateSession={handleNewSession}
             />
           </div>
 
-          <div className="lg:col-span-2 flex flex-col min-h-0">
+          <div className={`flex min-h-0 flex-col lg:col-span-2 ${mobileTab === 'profile' ? 'block' : 'hidden'} lg:block`}>
             <ProfilePanel
               profileData={state.profileData}
-              isUpdating={state.isLoading}
+              fieldDefinitions={state.profileFieldDefinitions}
+              isUpdating={state.profileData.isReasoningStreaming}
               onUpdateField={handleUpdateProfileField}
             />
           </div>
 
-          <div className="lg:col-span-3 flex flex-col min-h-0">
+          <div className={`flex min-h-0 flex-col lg:col-span-3 ${mobileTab === 'reasoning' ? 'block' : 'hidden'} lg:block`}>
             <ReasoningPanel
               key={state.currentSessionId ?? 'no-session'}
               sessionId={state.currentSessionId}
@@ -268,19 +393,86 @@ function App() {
           </div>
         </div>
 
-        <div className="lg:hidden mt-4 flex-shrink-0">
-          <SessionList
-            sessions={state.sessions}
-            currentSessionId={state.currentSessionId}
-            onSelectSession={handleSelectSession}
-            onDeleteSession={handleDeleteSession}
-            onNewSession={handleNewSession}
-            isLoading={state.isLoading}
-          />
-          <div className="mt-4">
-            <PrivacyNotice onClearAllData={handleClearAllData} isLoading={state.isLoading} />
+        {showClearDataConfirm && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 px-4 backdrop-blur-sm">
+            <button
+              type="button"
+              className="absolute inset-0 h-full w-full cursor-default"
+              aria-label="关闭清除数据确认弹层"
+              onClick={closeClearDataConfirm}
+            />
+            <div className="relative w-full max-w-md rounded-3xl border border-gray-200 bg-white p-6 shadow-2xl">
+              <h2 className="text-xl font-semibold text-gray-800">确认清除所有数据</h2>
+              <p className="mt-3 text-sm leading-6 text-gray-500">
+                这将删除所有会话、提取结果与本地画像信息，且无法恢复。
+              </p>
+              <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+                <button
+                  type="button"
+                  onClick={closeClearDataConfirm}
+                  disabled={isClearingAllData}
+                  className="rounded-2xl border border-gray-200 px-4 py-2.5 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:bg-gray-100"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleClearAllData()}
+                  disabled={isClearingAllData}
+                  className="rounded-2xl bg-red-600 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-red-700 disabled:cursor-not-allowed disabled:bg-red-300"
+                >
+                  {isClearingAllData ? '清除中...' : '确认清除'}
+                </button>
+              </div>
+            </div>
           </div>
-        </div>
+        )}
+
+        {isMobileSessionOpen && (
+          <div className="fixed inset-0 z-40 bg-slate-900/40 backdrop-blur-sm lg:hidden">
+            <button
+              type="button"
+              className="absolute inset-0 h-full w-full cursor-default"
+              aria-label="关闭会话面板遮罩"
+              onClick={() => setIsMobileSessionOpen(false)}
+            />
+            <div className="absolute inset-y-0 right-0 flex w-full max-w-sm flex-col border-l border-gray-200 bg-white shadow-2xl">
+              <div className="flex items-center justify-between border-b border-gray-200 px-4 py-4">
+                <div>
+                  <h2 className="text-lg font-semibold text-gray-800">会话与隐私</h2>
+                  <p className="mt-1 text-sm text-gray-500">切换会话、查看说明或清理本地数据。</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsMobileSessionOpen(false)}
+                  className="rounded-xl p-2 text-gray-500 hover:bg-gray-100"
+                  aria-label="关闭会话面板"
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
+                <SessionList
+                  sessions={state.sessions}
+                  currentSessionId={state.currentSessionId}
+                  onSelectSession={handleSelectSession}
+                  onDeleteSession={handleDeleteSession}
+                  onNewSession={handleNewSession}
+                  isLoading={state.loading.sessions}
+                  isCreating={isCreatingSession}
+                  deletingSessionId={deletingSessionId}
+                  compact
+                />
+                <PrivacyNotice
+                  onClearAllData={openClearDataConfirm}
+                  isLoading={isClearingAllData}
+                  actionLabel="清除中..."
+                  compact
+                />
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

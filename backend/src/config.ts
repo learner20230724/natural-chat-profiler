@@ -2,11 +2,16 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+function parseIntWithFallback(value: string | undefined, fallback: number) {
+  const parsed = Number.parseInt(value ?? '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 export const config = {
-  port: parseInt(process.env.PORT || '3001', 10),
+  port: parseIntWithFallback(process.env.PORT, 3001),
   db: {
     host: process.env.DB_HOST || 'localhost',
-    port: parseInt(process.env.DB_PORT || '3306', 10),
+    port: parseIntWithFallback(process.env.DB_PORT, 3306),
     user: process.env.DB_USER || 'root',
     password: process.env.DB_PASSWORD || '',
     database: process.env.DB_NAME || 'natural_chat_profiler',

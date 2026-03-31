@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import mysql from 'mysql2/promise';
-import { DatabasePool } from '../db/mysql';
+import { DatabaseExecutor, DatabasePool } from '../db/mysql';
 import { ReasonerJobRecord, ReasonerJobStatus, ReasonerTriggerType } from '../../types';
 
 interface JobRow extends mysql.RowDataPacket {
@@ -53,15 +53,15 @@ export class ReasonerJobRepository {
     return Number(rows[0]?.count ?? 0) > 0;
   }
 
-  async markRunning(id: string) {
-    await this.pool.query(
+  async markRunning(id: string, executor: DatabaseExecutor = this.pool) {
+    await executor.query(
       `UPDATE reasoner_jobs SET status = 'running', started_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [id]
     );
   }
 
-  async markCompleted(id: string, revisionId: string | null) {
-    await this.pool.query(
+  async markCompleted(id: string, revisionId: string | null, executor: DatabaseExecutor = this.pool) {
+    await executor.query(
       `UPDATE reasoner_jobs
        SET status = 'completed', finished_at = CURRENT_TIMESTAMP, result_revision_id = ?
        WHERE id = ?`,
@@ -69,8 +69,8 @@ export class ReasonerJobRepository {
     );
   }
 
-  async markFailed(id: string, errorMessage: string) {
-    await this.pool.query(
+  async markFailed(id: string, errorMessage: string, executor: DatabaseExecutor = this.pool) {
+    await executor.query(
       `UPDATE reasoner_jobs
        SET status = 'failed', finished_at = CURRENT_TIMESTAMP, error_message = ?
        WHERE id = ?`,

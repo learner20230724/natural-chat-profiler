@@ -13,11 +13,7 @@ const API_BASE_URL = '/api';
 function createEmptyProfileData(): ProfileData {
   return {
     sessionId: undefined,
-    age: null,
-    hometown: null,
-    currentCity: null,
-    personality: null,
-    expectations: null,
+    values: {},
     reasoning: null,
     reasoningHistory: [],
     currentReasoningDraft: null,
@@ -51,15 +47,49 @@ function mapMessage(message: {
   };
 }
 
+function mapLegacyProfileValues(profileData: {
+  age?: string | null;
+  hometown?: string | null;
+  currentCity?: string | null;
+  personality?: string | null;
+  expectations?: string | null;
+}) {
+  return {
+    age: profileData.age ?? null,
+    hometown: profileData.hometown ?? null,
+    currentCity: profileData.currentCity ?? null,
+    personality: profileData.personality ?? null,
+    expectations: profileData.expectations ?? null,
+  };
+}
+
+function normalizeProfileValues(
+  values: unknown,
+  profileData: {
+    age?: string | null;
+    hometown?: string | null;
+    currentCity?: string | null;
+    personality?: string | null;
+    expectations?: string | null;
+  }
+): Record<string, string | null> {
+  if (values && typeof values === 'object' && !Array.isArray(values)) {
+    return values as Record<string, string | null>;
+  }
+
+  return mapLegacyProfileValues(profileData);
+}
+
 function mapProfileData(
   profileData:
     | {
         sessionId?: string;
-        age: string | null;
-        hometown: string | null;
-        currentCity: string | null;
-        personality: string | null;
-        expectations: string | null;
+        values?: Record<string, string | null>;
+        age?: string | null;
+        hometown?: string | null;
+        currentCity?: string | null;
+        personality?: string | null;
+        expectations?: string | null;
         reasoning?: string | null;
         reasoningSummary?: string | null;
         updatedAt?: string | Date | null;
@@ -74,13 +104,11 @@ function mapProfileData(
     return createEmptyProfileData();
   }
 
+  const values = normalizeProfileValues(profileData.values, profileData);
+
   return {
     sessionId: profileData.sessionId,
-    age: profileData.age ?? null,
-    hometown: profileData.hometown ?? null,
-    currentCity: profileData.currentCity ?? null,
-    personality: profileData.personality ?? null,
-    expectations: profileData.expectations ?? null,
+    values,
     reasoning: profileData.reasoningSummary ?? profileData.reasoning ?? null,
     reasoningHistory,
     currentReasoningDraft: null,
@@ -124,8 +152,10 @@ function buildReasoningHistory(revisions: ProfileRevision[]) {
     .reverse()
     .map((revision) => ({
       reasoningText: revision.reasoningText || null,
-      finalOutputText: revision.profileSnapshot.finalOutputText || revision.profileSnapshot.reasoningSummary || null,
+      finalOutputText:
+        revision.profileSnapshot.finalOutputText || revision.profileSnapshot.reasoningSummary || null,
       timestamp: new Date(revision.createdAt),
+      source: revision.source,
     }));
 }
 
@@ -166,53 +196,64 @@ async function handleResponse<T>(response: Response): Promise<T> {
   return response.json();
 }
 
+async function fetchJson<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
+  try {
+    const response = await fetch(input, init);
+    return await handleResponse<T>(response);
+  } catch (error) {
+    if (error instanceof ApiClientError) {
+      throw error;
+    }
+
+    if (error instanceof Error) {
+      throw new ApiClientError(error.message || '网络请求失败');
+    }
+
+    throw new ApiClientError('网络请求失败');
+  }
+}
+
 export const sessionApi = {
   async createSession(): Promise<Session> {
-    const response = await fetch(`${API_BASE_URL}/sessions`, {
+    const result = await fetchJson<ApiResponse<Session>>(`${API_BASE_URL}/sessions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
     });
-
-    const result = await handleResponse<ApiResponse<Session>>(response);
     return mapSession(result.data);
   },
 
   async listSessions(): Promise<Session[]> {
-    const response = await fetch(`${API_BASE_URL}/sessions`);
-    const result = await handleResponse<ApiResponse<Session[]>>(response);
+    const result = await fetchJson<ApiResponse<Session[]>>(`${API_BASE_URL}/sessions`);
     return result.data.map(mapSession);
   },
 
   async getSession(sessionId: string): Promise<SessionDetail> {
-    const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}`);
-    const result = await handleResponse<ApiResponse<SessionDetail>>(response);
+    const result = await fetchJson<ApiResponse<SessionDetail>>(`${API_BASE_URL}/sessions/${sessionId}`);
 
     return {
       session: mapSession(result.data.session),
       messages: result.data.messages.map(mapMessage),
       profile: result.data.profile ? mapProfileData(result.data.profile) : null,
+      profileFieldDefinitions: result.data.profileFieldDefinitions,
     };
   },
 
   async deleteSession(sessionId: string): Promise<void> {
-    const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}`, {
+    await fetchJson<ApiResponse<{ sessionId: string }>>(`${API_BASE_URL}/sessions/${sessionId}`, {
       method: 'DELETE',
     });
-    await handleResponse<ApiResponse<{ sessionId: string }>>(response);
   },
 
   async clearAllData(): Promise<void> {
-    const response = await fetch(`${API_BASE_URL}/sessions/data`, {
+    await fetchJson<ApiResponse<{ cleared: boolean }>>(`${API_BASE_URL}/sessions/data`, {
       method: 'DELETE',
     });
-    await handleResponse<ApiResponse<{ cleared: boolean }>>(response);
   },
 
   async organizeSessions(): Promise<{ sessions: Session[]; deletedCount: number; renamedCount: number }> {
-    const response = await fetch(`${API_BASE_URL}/sessions/organize`, {
+    const result = await fetchJson<ApiResponse<{ sessions: Session[]; deletedCount: number; renamedCount: number }>>(`${API_BASE_URL}/sessions/organize`, {
       method: 'POST',
     });
-    const result = await handleResponse<ApiResponse<{ sessions: Session[]; deletedCount: number; renamedCount: number }>>(response);
     return {
       sessions: result.data.sessions.map(mapSession),
       deletedCount: result.data.deletedCount,
@@ -221,10 +262,39 @@ export const sessionApi = {
   },
 };
 
+function collectSseData(eventBlock: string) {
+  return eventBlock
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice(5).trimStart())
+    .join('\n')
+    .trim();
+}
+
+function parseSsePayload(eventBlock: string) {
+  const data = collectSseData(eventBlock);
+  if (!data || data === '[DONE]') {
+    return null;
+  }
+
+  try {
+    return JSON.parse(data) as {
+      type?: string;
+      content?: string;
+      data?: unknown;
+      error?: string;
+      finalOutputText?: string | null;
+      reasoningText?: string | null;
+    };
+  } catch (error) {
+    console.warn('Failed to parse SSE payload:', data, error);
+    throw new ApiClientError('流式响应格式错误');
+  }
+}
+
 export const messageApi = {
   async getMessages(sessionId: string): Promise<Message[]> {
-    const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/messages`);
-    const result = await handleResponse<ApiResponse<Message[]>>(response);
+    const result = await fetchJson<ApiResponse<Message[]>>(`${API_BASE_URL}/sessions/${sessionId}/messages`);
     return result.data.map(mapMessage);
   },
 
@@ -238,10 +308,12 @@ export const messageApi = {
     onReasoningChunk?: (chunk: string) => void,
     onReasoningStart?: () => void,
     onReasoningComplete?: (finalOutputText: string | null, reasoningText?: string | null) => void,
-    onAbort?: () => void
+    onAbort?: () => void,
+    abortController?: AbortController
   ): AbortController {
-    const abortController = new AbortController();
+    const controller = abortController ?? new AbortController();
     let completed = false;
+    let sawTerminalEvent = false;
 
     const finish = () => {
       if (completed) return;
@@ -254,7 +326,7 @@ export const messageApi = {
       completed = true;
       onAbort?.();
     };
-    abortController.signal.addEventListener('abort', abort);
+    controller.signal.addEventListener('abort', abort);
 
     void (async () => {
       try {
@@ -262,7 +334,7 @@ export const messageApi = {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ content }),
-          signal: abortController.signal,
+          signal: controller.signal,
         });
 
         if (!response.ok) {
@@ -284,52 +356,62 @@ export const messageApi = {
         while (true) {
           const { done, value } = await reader.read();
           if (done) {
-            finish();
             break;
           }
 
           buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
+          const eventBlocks = buffer.split(/\r?\n\r?\n/);
+          buffer = eventBlocks.pop() || '';
 
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue;
-            const data = line.slice(6).trim();
-            if (!data || data === '[DONE]') continue;
+          for (const eventBlock of eventBlocks) {
+            const parsed = parseSsePayload(eventBlock);
+            if (!parsed) {
+              continue;
+            }
 
-            try {
-              const parsed = JSON.parse(data) as {
-                type?: string;
-                content?: string;
-                data?: unknown;
-                error?: string;
-              };
-
-              if (parsed.type === 'assistant_chunk' && parsed.content) {
-                onChunk(parsed.content);
-              } else if (parsed.type === 'reasoner_started') {
-                onReasoningStart?.();
-              } else if (parsed.type === 'reasoner_chunk' && parsed.content) {
-                onReasoningChunk?.(parsed.content);
-              } else if (parsed.type === 'profile_updated' && parsed.data) {
-                onProfileUpdate?.(mapProfileData(parsed.data as Parameters<typeof mapProfileData>[0]));
-              } else if (parsed.type === 'reasoner_completed') {
-                onReasoningComplete?.(
-                  (parsed as { finalOutputText?: string | null }).finalOutputText ?? null,
-                  (parsed as { reasoningText?: string | null }).reasoningText ?? null
-                );
-              } else if (parsed.type === 'assistant_done' || parsed.type === 'done') {
-                finish();
-                return;
-              } else if (parsed.type === 'error') {
-                throw new ApiClientError(parsed.error || parsed.content || 'Unknown error');
-              }
-            } catch (parseError) {
-              if (parseError instanceof ApiClientError) {
-                throw parseError;
-              }
+            if (parsed.type === 'assistant_chunk' && parsed.content) {
+              onChunk(parsed.content);
+            } else if (parsed.type === 'reasoner_started') {
+              onReasoningStart?.();
+            } else if (parsed.type === 'reasoner_chunk' && parsed.content) {
+              onReasoningChunk?.(parsed.content);
+            } else if (parsed.type === 'profile_updated' && parsed.data) {
+              onProfileUpdate?.(mapProfileData(parsed.data as Parameters<typeof mapProfileData>[0]));
+            } else if (parsed.type === 'reasoner_completed') {
+              onReasoningComplete?.(parsed.finalOutputText ?? null, parsed.reasoningText ?? null);
+            } else if (parsed.type === 'assistant_done' || parsed.type === 'done') {
+              sawTerminalEvent = true;
+              finish();
+              return;
+            } else if (parsed.type === 'error') {
+              throw new ApiClientError(parsed.error || parsed.content || 'Unknown error');
             }
           }
+        }
+
+        const tailPayload = parseSsePayload(buffer);
+        if (tailPayload) {
+          if (tailPayload.type === 'assistant_chunk' && tailPayload.content) {
+            onChunk(tailPayload.content);
+          } else if (tailPayload.type === 'reasoner_started') {
+            onReasoningStart?.();
+          } else if (tailPayload.type === 'reasoner_chunk' && tailPayload.content) {
+            onReasoningChunk?.(tailPayload.content);
+          } else if (tailPayload.type === 'profile_updated' && tailPayload.data) {
+            onProfileUpdate?.(mapProfileData(tailPayload.data as Parameters<typeof mapProfileData>[0]));
+          } else if (tailPayload.type === 'reasoner_completed') {
+            onReasoningComplete?.(tailPayload.finalOutputText ?? null, tailPayload.reasoningText ?? null);
+          } else if (tailPayload.type === 'assistant_done' || tailPayload.type === 'done') {
+            sawTerminalEvent = true;
+            finish();
+            return;
+          } else if (tailPayload.type === 'error') {
+            throw new ApiClientError(tailPayload.error || tailPayload.content || 'Unknown error');
+          }
+        }
+
+        if (!sawTerminalEvent) {
+          throw new ApiClientError('流式响应异常结束');
         }
       } catch (error) {
         if (error instanceof Error && error.name === 'AbortError') {
@@ -341,39 +423,51 @@ export const messageApi = {
       }
     })();
 
-    return abortController;
+    return controller;
   },
 };
 
 export const profileApi = {
   async getProfileData(sessionId: string): Promise<ProfileData> {
-    const [profileResponse, revisionsResponse] = await Promise.all([
-      fetch(`${API_BASE_URL}/sessions/${sessionId}/profile`),
-      fetch(`${API_BASE_URL}/sessions/${sessionId}/profile/revisions`),
+    const settledResults = await Promise.allSettled([
+      fetchJson<ApiResponse<ProfileData | null>>(`${API_BASE_URL}/sessions/${sessionId}/profile`),
+      fetchJson<ApiResponse<ProfileRevision[]>>(`${API_BASE_URL}/sessions/${sessionId}/profile/revisions`),
     ]);
 
-    const profileResult = await handleResponse<ApiResponse<ProfileData | null>>(profileResponse);
-    const revisionsResult = await handleResponse<ApiResponse<ProfileRevision[]>>(revisionsResponse);
+    const profileResult = settledResults[0].status === 'fulfilled' ? settledResults[0].value : null;
+    const revisionsResult = settledResults[1].status === 'fulfilled' ? settledResults[1].value : null;
+    const errors = settledResults
+      .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      .map((result) => (result.reason instanceof ApiClientError ? result.reason.message : '网络请求失败'));
 
-    return mapProfileData(profileResult.data, buildReasoningHistory(revisionsResult.data));
+    if (!profileResult && !revisionsResult) {
+      throw new ApiClientError(errors.join('；') || '加载画像失败');
+    }
+
+    const profileData = profileResult?.data ?? null;
+    const revisions = revisionsResult?.data ?? [];
+    return mapProfileData(profileData, buildReasoningHistory(revisions));
   },
 
   async analyzeProfile(sessionId: string): Promise<ProfileData> {
-    const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/profile/analyze`, {
-      method: 'POST',
-    });
-    const result = await handleResponse<
+    const result = await fetchJson<
       ApiResponse<{
         jobId: string;
         profile: ProfileData;
         revision: ProfileRevision;
       }>
-    >(response);
+    >(`${API_BASE_URL}/sessions/${sessionId}/profile/analyze`, {
+      method: 'POST',
+    });
 
     return mapProfileData(result.data.profile, [{
       reasoningText: result.data.revision.reasoningText || null,
-      finalOutputText: result.data.revision.profileSnapshot.finalOutputText || result.data.revision.profileSnapshot.reasoningSummary || null,
+      finalOutputText:
+        result.data.revision.profileSnapshot.finalOutputText ||
+        result.data.revision.profileSnapshot.reasoningSummary ||
+        null,
       timestamp: new Date(result.data.revision.createdAt),
+      source: result.data.revision.source,
     }]);
   },
 
@@ -382,32 +476,39 @@ export const profileApi = {
     field: string,
     value: string
   ): Promise<ProfileData> {
-    const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/profile`, {
+    const result = await fetchJson<ApiResponse<ProfileData>>(`${API_BASE_URL}/sessions/${sessionId}/profile`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ [field]: value }),
     });
 
-    const result = await handleResponse<ApiResponse<ProfileData>>(response);
     return mapProfileData(result.data);
   },
 
   async getProfileRevisions(sessionId: string): Promise<ProfileRevision[]> {
-    const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/profile/revisions`);
-    const result = await handleResponse<ApiResponse<ProfileRevision[]>>(response);
+    const result = await fetchJson<ApiResponse<ProfileRevision[]>>(`${API_BASE_URL}/sessions/${sessionId}/profile/revisions`);
     return result.data.map(mapProfileRevision);
   },
 
   async getReasonerJobs(sessionId: string): Promise<ReasonerJob[]> {
-    const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/reasoner-jobs`);
-    const result = await handleResponse<ApiResponse<ReasonerJob[]>>(response);
+    const result = await fetchJson<ApiResponse<ReasonerJob[]>>(`${API_BASE_URL}/sessions/${sessionId}/reasoner-jobs`);
     return result.data.map(mapReasonerJob);
   },
 };
 
 export const exportApi = {
   async downloadPDF(sessionId: string, filename = 'profile.pdf'): Promise<void> {
-    const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/export/pdf`);
+    let response: Response;
+
+    try {
+      response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/export/pdf`);
+    } catch (error) {
+      if (error instanceof Error) {
+        throw new ApiClientError(error.message || '网络请求失败');
+      }
+      throw new ApiClientError('网络请求失败');
+    }
+
     if (!response.ok) {
       throw new ApiClientError(`HTTP ${response.status}: ${response.statusText}`);
     }

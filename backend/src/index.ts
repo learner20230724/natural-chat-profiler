@@ -8,7 +8,17 @@ async function start() {
 
   try {
     await verifyDatabaseConnection(container.db.pool);
-    await container.db.initializeSchema();
+    const schemaResult = await container.db.initializeSchema();
+
+    if (schemaResult.appliedSteps.length > 0) {
+      console.log(
+        `[schema] applied steps: ${schemaResult.appliedSteps
+          .map((step) => `v${step.version} ${step.name}`)
+          .join(', ')}`
+      );
+    } else {
+      console.log(`[schema] schema already up to date at v${schemaResult.currentVersion}`);
+    }
 
     const app = createApp(container);
     const server = app.listen(config.port, () => {
@@ -17,9 +27,16 @@ async function start() {
     });
 
     const shutdown = async () => {
-      server.close(async () => {
-        await container.db.pool.end();
-        process.exit(0);
+      server.close(() => {
+        void (async () => {
+          try {
+            await container.db.pool.end();
+            process.exit(0);
+          } catch (error) {
+            console.error('Error during shutdown:', error);
+            process.exit(1);
+          }
+        })();
       });
     };
 

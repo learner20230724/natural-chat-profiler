@@ -2,26 +2,48 @@ import { ProfileSnapshot } from '../types';
 
 export interface MergeProfileInput {
   current: ProfileSnapshot | null;
-  incoming: Partial<Pick<ProfileSnapshot, 'age' | 'hometown' | 'currentCity' | 'personality' | 'expectations'>>;
+  incoming: Record<string, string | null | undefined>;
   reasoningSummary?: string | null;
   confidence?: Record<string, number> | null;
 }
 
 export function mergeProfileSnapshot(input: MergeProfileInput) {
   const current = input.current;
+  const nextValues: Record<string, string | null> = {
+    ...(current?.values ?? {}),
+  };
+
+  Object.entries(input.incoming).forEach(([key, value]) => {
+    const normalized = normalizeValue(value);
+    if (normalized !== undefined) {
+      nextValues[key] = normalized;
+    }
+  });
 
   return {
-    age: normalizeValue(input.incoming.age) ?? current?.age ?? null,
-    hometown: normalizeValue(input.incoming.hometown) ?? current?.hometown ?? null,
-    currentCity: normalizeValue(input.incoming.currentCity) ?? current?.currentCity ?? null,
-    personality: normalizeValue(input.incoming.personality) ?? current?.personality ?? null,
-    expectations: normalizeValue(input.incoming.expectations) ?? current?.expectations ?? null,
+    values: nextValues,
     confidence: input.confidence ?? current?.confidence ?? null,
     reasoningSummary: input.reasoningSummary ?? current?.reasoningSummary ?? null,
   };
 }
 
-function normalizeValue(value: string | null | undefined) {
-  const trimmed = value?.trim();
-  return trimmed ? trimmed : null;
+function normalizeValue(value: unknown) {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed ? trimmed : null;
+  }
+
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? String(value) : null;
+  }
+
+  if (typeof value === 'boolean' || typeof value === 'bigint') {
+    return String(value);
+  }
+
+  return undefined;
 }

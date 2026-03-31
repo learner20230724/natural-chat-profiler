@@ -20,13 +20,12 @@ export class PDFService {
   }
 
   private generateHTML(session: SessionRecord, profile: ProfileSnapshot | null) {
-    const fields = [
-      ['年龄', profile?.age],
-      ['家庭所在城市', profile?.hometown],
-      ['现居城市', profile?.currentCity],
-      ['性格特征', profile?.personality],
-      ['期待的对象特征', profile?.expectations],
-    ];
+    const values = profile?.values ?? {};
+    const fields = session.profileFieldDefinitions.map((field) => [
+      field.label,
+      values[field.key] ?? null,
+      field.placeholder || '待了解',
+    ] as const);
 
     return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -44,13 +43,22 @@ export class PDFService {
 </head>
 <body>
   <h1>用户信息表</h1>
-  <div class="meta">会话 ID: ${session.id}</div>
+  <div class="meta">会话 ID: ${escapeHtml(session.id)}</div>
   ${fields
     .map(
-      ([label, value]) => `<div class="field"><div class="label">${label}</div><div class="${value ? '' : 'empty'}">${value || '待了解'}</div></div>`
+      ([label, value, placeholder]) => `<div class="field"><div class="label">${escapeHtml(label)}</div><div class="${value ? '' : 'empty'}">${value ? escapeHtml(value) : escapeHtml(placeholder ?? '待了解')}</div></div>`
     )
     .join('')}
 </body>
 </html>`;
   }
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }

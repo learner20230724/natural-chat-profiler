@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import mysql from 'mysql2/promise';
-import { DatabasePool } from '../db/mysql';
-import { SessionRecord, SessionStatus } from '../../types';
+import { DatabaseConnection, DatabaseExecutor, DatabasePool } from '../db/mysql';
+import { ProfileFieldDefinition, SessionRecord, SessionStatus } from '../../types';
 
 interface SessionRow extends mysql.RowDataPacket {
   id: string;
@@ -15,10 +15,25 @@ interface SessionRow extends mysql.RowDataPacket {
   profile_version: number;
   is_minor_flagged: number;
   privacy_cleared_at: Date | null;
+  is_initializing: number;
+  profile_fields_json: string | null;
 }
 
 export interface CreateSessionInput {
   title?: string | null;
+  profileFieldDefinitions?: ProfileFieldDefinition[];
+}
+
+const DEFAULT_PROFILE_FIELDS: ProfileFieldDefinition[] = [
+  { key: 'age', label: '年龄', placeholder: '待了解' },
+  { key: 'hometown', label: '家庭所在城市', placeholder: '待了解' },
+  { key: 'currentCity', label: '现居城市', placeholder: '待了解' },
+  { key: 'personality', label: '性格特征', placeholder: '待了解' },
+  { key: 'expectations', label: '期待的对象特征', placeholder: '待了解' },
+];
+
+export function getDefaultProfileFields() {
+  return DEFAULT_PROFILE_FIELDS.map((field) => ({ ...field }));
 }
 
 export class SessionRepository {
@@ -26,7 +41,12 @@ export class SessionRepository {
 
   async create(input: CreateSessionInput = {}) {
     const id = randomUUID();
-    await this.pool.query('INSERT INTO sessions (id, title) VALUES (?, ?)', [id, input.title ?? null]);
+    const profileFields = input.profileFieldDefinitions ?? getDefaultProfileFields();
+    await this.pool.query('INSERT INTO sessions (id, title, profile_fields_json) VALUES (?, ?, ?)', [
+      id,
+      input.title ?? null,
+      JSON.stringify(profileFields),
+    ]);
     const session = await this.findById(id);
 
     if (!session) {
@@ -36,8 +56,11 @@ export class SessionRepository {
     return session;
   }
 
-  async findById(id: string) {
-    const [rows] = await this.pool.query<SessionRow[]>('SELECT * FROM sessions WHERE id = ?', [id]);
+  async findById(id: string, options: { includeDeleted?: boolean } = {}) {
+    const [rows] = await this.pool.query<SessionRow[]>(
+      `SELECT * FROM sessions WHERE id = ? ${options.includeDeleted ? '' : "AND status != 'deleted'"}`,
+      [id]
+    );
     return rows[0] ? mapSession(rows[0]) : null;
   }
 
@@ -48,12 +71,24 @@ export class SessionRepository {
     return rows.map(mapSession);
   }
 
+  async lockById(id: string, connection: DatabaseConnection) {
+    const [rows] = await connection.query<SessionRow[]>('SELECT * FROM sessions WHERE id = ? FOR UPDATE', [id]);
+    return rows[0] ? mapSession(rows[0]) : null;
+  }
+
   async updateTitle(id: string, title: string | null) {
     await this.pool.query('UPDATE sessions SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [title, id]);
   }
 
-  async incrementMessageCounter(id: string) {
+  async updateProfileFields(id: string, profileFieldDefinitions: ProfileFieldDefinition[]) {
     await this.pool.query(
+      'UPDATE sessions SET profile_fields_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      [JSON.stringify(profileFieldDefinitions), id]
+    );
+  }
+
+  async incrementMessageCounter(id: string, executor: DatabaseExecutor = this.pool) {
+    await executor.query(
       `UPDATE sessions
        SET message_count_since_reasoner = message_count_since_reasoner + 1,
            last_message_at = CURRENT_TIMESTAMP,
@@ -63,8 +98,13 @@ export class SessionRepository {
     );
   }
 
-  async markReasonerCompleted(id: string, profileVersion: number, isMinorFlagged: boolean) {
-    await this.pool.query(
+  async markReasonerCompleted(
+    id: string,
+    profileVersion: number,
+    isMinorFlagged: boolean,
+    executor: DatabaseExecutor = this.pool
+  ) {
+    await executor.query(
       `UPDATE sessions
        SET last_reasoner_run_at = CURRENT_TIMESTAMP,
            message_count_since_reasoner = 0,
@@ -76,11 +116,23 @@ export class SessionRepository {
     );
   }
 
-  async markPrivacyCleared(id: string) {
+  async clearPrivacyData(id: string) {
     await this.pool.query(
       `UPDATE sessions
        SET privacy_cleared_at = CURRENT_TIMESTAMP,
            status = 'deleted',
+           title = NULL,
+           is_initializing = FALSE,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [id]
+    );
+  }
+
+  async clearInitializing(id: string, executor: DatabaseExecutor = this.pool) {
+    await executor.query(
+      `UPDATE sessions
+       SET is_initializing = FALSE,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
       [id]
@@ -96,6 +148,43 @@ export class SessionRepository {
   }
 }
 
+function safeJsonParse(value: string | null | undefined): unknown | null {
+  if (!value) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function isProfileFieldDefinition(value: unknown): value is ProfileFieldDefinition {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+
+  const record = value as Record<string, unknown>;
+  return typeof record.key === 'string' && typeof record.label === 'string';
+}
+
+function parseProfileFieldDefinitions(raw: string | null): ProfileFieldDefinition[] {
+  const parsed = safeJsonParse(raw);
+  if (!Array.isArray(parsed)) {
+    return DEFAULT_PROFILE_FIELDS;
+  }
+
+  const filtered = parsed.filter(isProfileFieldDefinition).map((item) => ({
+    key: item.key,
+    label: item.label,
+    placeholder: typeof item.placeholder === 'string' ? item.placeholder : null,
+    promptHint: typeof item.promptHint === 'string' ? item.promptHint : null,
+  }));
+
+  return filtered.length > 0 ? filtered : getDefaultProfileFields();
+}
+
 function mapSession(row: SessionRow): SessionRecord {
   return {
     id: row.id,
@@ -109,5 +198,7 @@ function mapSession(row: SessionRow): SessionRecord {
     profileVersion: row.profile_version,
     isMinorFlagged: Boolean(row.is_minor_flagged),
     privacyClearedAt: row.privacy_cleared_at ? new Date(row.privacy_cleared_at) : null,
+    isInitializing: Boolean(row.is_initializing),
+    profileFieldDefinitions: parseProfileFieldDefinitions(row.profile_fields_json),
   };
 }

@@ -5,16 +5,18 @@ import {
   shouldTriggerReasoner,
 } from '../domain/reasonerPolicy';
 import { DeepSeekClient } from '../infrastructure/ai/DeepSeekClient';
+import { DatabasePool } from '../infrastructure/db/mysql';
 import { MessageRepository } from '../infrastructure/repositories/MessageRepository';
 import { ProfileRepository } from '../infrastructure/repositories/ProfileRepository';
 import { ReasonerJobRepository } from '../infrastructure/repositories/ReasonerJobRepository';
 import { SessionRepository } from '../infrastructure/repositories/SessionRepository';
 import { buildProfileReasonerPrompt } from './ProfilePromptBuilder';
-import { NotFoundError } from '../shared/errors';
+import { NotFoundError, ValidationError } from '../shared/errors';
 import { ProfileSnapshot, ReasonerTriggerType } from '../types';
 
 export class ProfileService {
   constructor(
+    private readonly pool: DatabasePool,
     private readonly sessions: SessionRepository,
     private readonly messages: MessageRepository,
     private readonly profiles: ProfileRepository,
@@ -32,70 +34,93 @@ export class ProfileService {
     return this.profiles.listRevisions(sessionId);
   }
 
-  async updateProfile(sessionId: string, updates: Partial<Pick<ProfileSnapshot, 'age' | 'hometown' | 'currentCity' | 'personality' | 'expectations'>>) {
-    const session = await this.ensureSessionExists(sessionId);
-    const current = await this.profiles.findBySessionId(sessionId);
-    const merged = mergeProfileSnapshot({ current, incoming: updates });
-    const version = Math.max(session.profileVersion + 1, (current?.version ?? 0) + 1, 1);
+  async updateProfile(sessionId: string, updates: Record<string, string>) {
+    const connection = await this.pool.getConnection();
 
-    // 获取之前的完整 reasoningText（如果之前有 reasoner 生成的思考内容）
-    let existingReasoningText: string | null = null;
-    if (current?.reasoningSummary != null) {
-      const revisions = await this.profiles.listRevisions(sessionId);
-      const latestRevision = revisions[0];
-      existingReasoningText = latestRevision?.reasoningText ?? null;
-    }
+    try {
+      await connection.beginTransaction();
 
-    const saved = await this.profiles.upsert(sessionId, {
-      ...merged,
-      version,
-    });
+      const session = await this.ensureSessionExists(sessionId);
+      const allowedKeys = new Set(session.profileFieldDefinitions.map((field) => field.key));
+      const normalizedUpdates: Record<string, string | null> = {};
 
-    // 如果之前有思考内容，保留原有的 reasoningText，不被覆盖
-    if (existingReasoningText) {
-      await this.profiles.createRevision({
-        sessionId,
-        source: 'manual',
-        snapshot: {
-          age: saved.age,
-          hometown: saved.hometown,
-          currentCity: saved.currentCity,
-          personality: saved.personality,
-          expectations: saved.expectations,
-          confidence: saved.confidence,
-          reasoningSummary: saved.reasoningSummary,
-          version: saved.version,
-          finalOutputText: saved.reasoningSummary,
-        },
-        reasoningText: existingReasoningText,
+      Object.entries(updates).forEach(([key, value]) => {
+        if (!allowedKeys.has(key)) {
+          throw new ValidationError(`字段 ${key} 不在当前会话配置中`);
+        }
+        normalizedUpdates[key] = value;
       });
-    } else {
-      await this.profiles.createRevision({
-        sessionId,
-        source: 'manual',
-        snapshot: {
-          age: saved.age,
-          hometown: saved.hometown,
-          currentCity: saved.currentCity,
-          personality: saved.personality,
-          expectations: saved.expectations,
-          confidence: saved.confidence,
-          reasoningSummary: saved.reasoningSummary,
-          version: saved.version,
-          finalOutputText: saved.reasoningSummary,
-        },
-        reasoningText: saved.reasoningSummary,
-      });
-    }
 
-    await this.sessions.markReasonerCompleted(sessionId, version, detectMinorFlag(saved));
-    return saved;
+      const current = await this.profiles.findBySessionId(sessionId, connection);
+      const merged = mergeProfileSnapshot({ current, incoming: normalizedUpdates });
+      merged.values = trimProfileValues(merged.values, allowedKeys);
+      const version = Math.max(session.profileVersion + 1, (current?.version ?? 0) + 1, 1);
+
+      let existingReasoningText: string | null = null;
+      let existingFinalOutputText: string | null = null;
+      if (current?.reasoningSummary != null) {
+        const revisions = await this.profiles.listRevisions(sessionId, connection);
+        const latestRevision = revisions[0];
+        existingReasoningText = latestRevision?.reasoningText ?? null;
+        existingFinalOutputText = latestRevision?.profileSnapshot.finalOutputText ?? null;
+      }
+
+      const saved = await this.profiles.upsert(
+        sessionId,
+        {
+          ...merged,
+          version,
+        },
+        connection
+      );
+
+      const snapshot = {
+        ...saved,
+        finalOutputText: existingFinalOutputText ?? saved.reasoningSummary,
+      };
+
+      if (existingReasoningText) {
+        await this.profiles.createRevision(
+          {
+            sessionId,
+            source: 'manual',
+            snapshot,
+            reasoningText: existingReasoningText,
+          },
+          connection
+        );
+      } else {
+        await this.profiles.createRevision(
+          {
+            sessionId,
+            source: 'manual',
+            snapshot,
+            reasoningText: saved.reasoningSummary,
+          },
+          connection
+        );
+      }
+
+      await this.sessions.markReasonerCompleted(sessionId, version, detectMinorFlag(saved, allowedKeys), connection);
+      await connection.commit();
+
+      return saved;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
   }
 
   async analyzeProfile(
     sessionId: string,
     triggerType: ReasonerTriggerType,
-    onReasoningChunk?: (chunk: string) => void
+    onReasoningChunk?: (chunk: string) => void,
+    options?: {
+      signal?: AbortSignal;
+      onStarted?: () => void;
+    }
   ) {
     const session = await this.ensureSessionExists(sessionId);
     const current = await this.profiles.findBySessionId(sessionId);
@@ -103,52 +128,33 @@ export class ProfileService {
     const job = await this.reasonerJobs.create(sessionId, triggerType);
 
     await this.reasonerJobs.markRunning(job.id);
+    options?.onStarted?.();
 
     try {
+      const fieldDefinitions = session.profileFieldDefinitions;
       const result = await this.aiClient.streamReasoner(
-        buildProfileReasonerPrompt(messageHistory, current),
-        onReasoningChunk
+        buildProfileReasonerPrompt(messageHistory, current, fieldDefinitions),
+        onReasoningChunk,
+        { signal: options?.signal }
       );
 
-      const summaryText = summarizeFinalOutput(result.finalOutputText, result.reasoning);
-      const merged = mergeProfileSnapshot({
+      const revision = await this.runReasonerPersistenceTransaction({
+        session,
         current,
-        incoming: result.profileData,
-        reasoningSummary: summaryText,
-      });
-      const version = Math.max(session.profileVersion + 1, (current?.version ?? 0) + 1, 1);
-      const saved = await this.profiles.upsert(sessionId, {
-        ...merged,
-        version,
+        jobId: job.id,
+        result,
       });
 
-      console.log('[DEBUG ProfileService] createRevision - reasoningText length:', result.reasoning?.length);
-      console.log('[DEBUG ProfileService] createRevision - reasoningText preview:', result.reasoning?.slice(0, 100));
-
-      const revision = await this.profiles.createRevision({
-        sessionId,
-        source: 'reasoner',
-        snapshot: {
-          age: saved.age,
-          hometown: saved.hometown,
-          currentCity: saved.currentCity,
-          personality: saved.personality,
-          expectations: saved.expectations,
-          confidence: saved.confidence,
-          reasoningSummary: saved.reasoningSummary,
-          version: saved.version,
-          finalOutputText: result.finalOutputText || saved.reasoningSummary,
-        },
-        reasoningText: result.reasoning,
-      });
-
-      await this.reasonerJobs.markCompleted(job.id, revision.id);
-      await this.sessions.markReasonerCompleted(sessionId, version, detectMinorFlag(saved));
-
-      return { jobId: job.id, profile: saved, revision };
+      return { jobId: job.id, profile: revision.profile, revision: revision.revision };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown reasoner error';
-      await this.reasonerJobs.markFailed(job.id, message);
+
+      if (error instanceof Error && error.name === 'AbortError') {
+        await this.reasonerJobs.markFailed(job.id, '分析已中止');
+        throw error;
+      }
+
+      await this.reasonerJobs.markFailed(job.id, message.slice(0, 500));
       throw error;
     }
   }
@@ -168,7 +174,11 @@ export class ProfileService {
 
   async maybeAnalyzeProfile(
     sessionId: string,
-    onReasoningChunk?: (chunk: string) => void
+    onReasoningChunk?: (chunk: string) => void,
+    options?: {
+      signal?: AbortSignal;
+      onStarted?: () => void;
+    }
   ) {
     const session = await this.ensureSessionExists(sessionId);
     const trigger = await this.shouldAutoAnalyze(sessionId);
@@ -182,7 +192,10 @@ export class ProfileService {
         ? 'message_threshold'
         : 'timer';
 
-    return this.analyzeProfile(sessionId, triggerType, onReasoningChunk);
+    return this.analyzeProfile(sessionId, triggerType, onReasoningChunk, {
+      ...options,
+      onStarted: options?.onStarted,
+    });
   }
 
   async listJobs(sessionId: string) {
@@ -198,6 +211,67 @@ export class ProfileService {
     return job;
   }
 
+  private async runReasonerPersistenceTransaction(params: {
+    session: Awaited<ReturnType<ProfileService['ensureSessionExists']>>;
+    current: Awaited<ReturnType<ProfileRepository['findBySessionId']>>;
+    jobId: string;
+    result: Awaited<ReturnType<DeepSeekClient['streamReasoner']>>;
+  }) {
+    const connection = await this.pool.getConnection();
+
+    try {
+      await connection.beginTransaction();
+
+      const allowedKeys = new Set(params.session.profileFieldDefinitions.map((field) => field.key));
+      const filteredProfileData = trimProfileValues(params.result.profileData, allowedKeys);
+      const summaryText = summarizeFinalOutput(params.result.finalOutputText, params.result.reasoning);
+      const merged = mergeProfileSnapshot({
+        current: params.current,
+        incoming: filteredProfileData,
+        reasoningSummary: summaryText,
+      });
+      merged.values = trimProfileValues(merged.values, allowedKeys);
+      const version = Math.max(params.session.profileVersion + 1, (params.current?.version ?? 0) + 1, 1);
+      const profile = await this.profiles.upsert(
+        params.session.id,
+        {
+          ...merged,
+          version,
+        },
+        connection
+      );
+
+      const revision = await this.profiles.createRevision(
+        {
+          sessionId: params.session.id,
+          source: 'reasoner',
+          snapshot: {
+            ...profile,
+            finalOutputText: params.result.finalOutputText || profile.reasoningSummary,
+          },
+          reasoningText: params.result.reasoning,
+        },
+        connection
+      );
+
+      await this.reasonerJobs.markCompleted(params.jobId, revision.id, connection);
+      await this.sessions.markReasonerCompleted(
+        params.session.id,
+        version,
+        detectMinorFlag(profile, allowedKeys),
+        connection
+      );
+
+      await connection.commit();
+      return { profile, revision };
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  }
+
   private async ensureSessionExists(sessionId: string) {
     const session = await this.sessions.findById(sessionId);
     if (!session) {
@@ -207,12 +281,17 @@ export class ProfileService {
   }
 }
 
-function detectMinorFlag(profile: ProfileSnapshot | null) {
-  if (!profile?.age) {
+function detectMinorFlag(profile: ProfileSnapshot | null, allowedKeys: Set<string>) {
+  if (!profile || !allowedKeys.has('age')) {
     return false;
   }
 
-  return /(未成年|1[0-7]岁|小学|初中|高中)/.test(profile.age);
+  const ageValue = profile.values?.age;
+  if (!ageValue) {
+    return false;
+  }
+
+  return /(未成年|1[0-7]岁|小学|初中|高中)/.test(ageValue);
 }
 
 function summarizeFinalOutput(finalOutputText: string, fallback: string) {
@@ -224,4 +303,14 @@ function summarizeFinalOutput(finalOutputText: string, fallback: string) {
   const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
   const candidate = jsonMatch ? trimmed.replace(jsonMatch[0], '').trim() : trimmed;
   return candidate || trimmed.slice(0, 400);
+}
+
+function trimProfileValues(values: Record<string, string | null>, allowedKeys: Set<string>) {
+  const trimmed: Record<string, string | null> = {};
+  Object.entries(values ?? {}).forEach(([key, value]) => {
+    if (allowedKeys.has(key)) {
+      trimmed[key] = value;
+    }
+  });
+  return trimmed;
 }

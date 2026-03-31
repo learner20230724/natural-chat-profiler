@@ -3,6 +3,7 @@ import { config } from '../../config';
 
 export type DatabasePool = mysql.Pool;
 export type DatabaseConnection = mysql.PoolConnection;
+export type DatabaseExecutor = DatabasePool | DatabaseConnection;
 
 export function createMySqlPool() {
   return mysql.createPool({

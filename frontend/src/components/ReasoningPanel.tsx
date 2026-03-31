@@ -23,10 +23,9 @@ export function ReasoningPanel({
   const previousSessionRef = useRef<string | null>(null);
 
   const hasHistory = reasoningHistory.length > 0;
-  const streamingVirtualIndex = reasoningHistory.length; // 虚拟索引用于显示流式内容
+  const streamingVirtualIndex = reasoningHistory.length;
   const isViewingCurrentStream = isStreaming && currentIndex >= streamingVirtualIndex;
 
-  // 会话切换时重置索引与滚动状态
   useEffect(() => {
     if (previousSessionRef.current !== sessionId) {
       previousSessionRef.current = sessionId;
@@ -42,19 +41,14 @@ export function ReasoningPanel({
     }
   }, [sessionId, isStreaming, reasoningHistory.length, streamingVirtualIndex]);
 
-  // 流式状态变化时，自动跳到当前流
   useEffect(() => {
     if (isStreaming) {
       setCurrentIndex(streamingVirtualIndex);
-    } else {
-      // 流结束后若在虚拟索引，回落到最新历史项
-      if (currentIndex >= streamingVirtualIndex && reasoningHistory.length > 0) {
-        setCurrentIndex(reasoningHistory.length - 1);
-      }
+    } else if (currentIndex >= streamingVirtualIndex && reasoningHistory.length > 0) {
+      setCurrentIndex(reasoningHistory.length - 1);
     }
   }, [isStreaming, streamingVirtualIndex, reasoningHistory.length, currentIndex]);
 
-  // 历史长度变化时，默认展示最新一条
   useEffect(() => {
     const prevLen = previousHistoryLengthRef.current;
     const grew = reasoningHistory.length > prevLen;
@@ -67,7 +61,6 @@ export function ReasoningPanel({
       setCurrentIndex(0);
     }
 
-    // 边界修正
     if (!isStreaming && currentIndex > Math.max(reasoningHistory.length - 1, 0)) {
       setCurrentIndex(Math.max(reasoningHistory.length - 1, 0));
     }
@@ -109,10 +102,10 @@ export function ReasoningPanel({
     : currentStep?.reasoningText ?? null;
 
   const displayFinalOutputText = currentStep?.finalOutputText ?? null;
-
   const displayTimestamp = !isStreaming && hasHistory && currentIndex < reasoningHistory.length
     ? reasoningHistory[currentIndex]?.timestamp
     : null;
+  const displaySource = isStreaming ? 'streaming' : currentStep?.source;
 
   const canGoPrev = currentIndex > 0;
   const canGoNext = currentIndex < reasoningHistory.length - 1;
@@ -158,6 +151,20 @@ export function ReasoningPanel({
       minute: '2-digit',
     });
   };
+
+  const formatSource = (source?: ReasoningStep['source']) => {
+    if (source === 'manual') return '手动';
+    if (source === 'reasoner') return 'reasoner';
+    if (source === 'system') return 'system';
+    if (source === 'streaming') return '当前流式';
+    return '历史记录';
+  };
+
+  const emptyMessage = !sessionId
+    ? '选择一个会话后，这里会展示对应的思考过程与历史。'
+    : hasHistory
+      ? '暂无可展示的思考内容。'
+      : '当前会话还没有触发分析，后续对话达到条件后会显示在这里。';
 
   return (
     <div className="flex flex-col h-full min-h-0 rounded-2xl border border-gray-200/80 bg-white/95 shadow-[0_12px_30px_rgba(15,23,42,0.08)] backdrop-blur-sm overflow-hidden">
@@ -214,9 +221,14 @@ export function ReasoningPanel({
             </div>
           )}
         </div>
-        {displayTimestamp && (
-          <p className="text-xs text-gray-400 mt-2">{formatTimestamp(displayTimestamp)}</p>
-        )}
+        <div className="mt-2 flex items-center gap-2 text-xs text-gray-400">
+          {displayTimestamp && <span>{formatTimestamp(displayTimestamp)}</span>}
+          {displaySource && (
+            <span className="rounded-full bg-gray-100 px-2 py-0.5 text-gray-500 ring-1 ring-gray-200">
+              来源：{formatSource(displaySource)}
+            </span>
+          )}
+        </div>
       </div>
 
       <div
@@ -241,14 +253,13 @@ export function ReasoningPanel({
           </div>
         ) : (
           <div className="flex flex-col items-center justify-center h-full text-gray-400">
-            <div className="rounded-2xl border border-dashed border-gray-200 bg-gray-50 px-6 py-8 text-center">
-              <p className="text-sm italic">暂无思考过程</p>
+            <div className="rounded-2xl border border-dashed border-gray-200 bg-gray-50 px-6 py-8 text-center max-w-md">
+              <p className="text-sm leading-6">{emptyMessage}</p>
             </div>
           </div>
         )}
       </div>
 
-      {/* 最终结果固定框 - 始终显示当前最新的最终结果 */}
       <div className="flex-shrink-0 border-t border-gray-200/80 bg-white">
         <div className="px-6 py-3">
           <div className="flex items-center gap-2 mb-2">
@@ -263,7 +274,7 @@ export function ReasoningPanel({
             </div>
           ) : (
             <div className="text-gray-400 text-sm italic">
-              {isStreaming ? '等待生成最终结果...' : '暂无最终结果'}
+              {isStreaming ? '等待生成最终结果...' : '暂无最终结果，可继续对话触发新的分析。'}
             </div>
           )}
         </div>
@@ -277,7 +288,7 @@ export function ReasoningPanel({
               <div className="w-2 h-2 bg-amber-500 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></div>
               <div className="w-2 h-2 bg-amber-500 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
             </div>
-            <span className="text-sm">DeepSeek Reasoner 正在思考...</span>
+            <span className="text-sm">DeepSeek Reasoner 正在思考，历史会在完成后归档到这里。</span>
           </div>
         </div>
       )}
