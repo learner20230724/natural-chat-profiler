@@ -41,3 +41,10 @@ coverage/
 .cache/
 .temp/
 .tmp/
+
+# Claude local data
+.claude/
+frontend/.claude/
+
+# Local thesis drafts
+论文结构/
