@@ -4,6 +4,7 @@ import { ProfileService } from '../services/ProfileService';
 import { ValidationError } from '../shared/errors';
 import { asyncHandler } from '../shared/http';
 import { successResponse } from '../shared/api';
+import { reasonerStreamRegistry } from '../infrastructure/ReasonerStreamRegistry';
 
 export default function createChatRouter(chatService: ChatService, profileService: ProfileService) {
   const router = Router();
@@ -19,6 +20,17 @@ export default function createChatRouter(chatService: ChatService, profileServic
   router.post('/:sessionId/chat', async (req, res, next) => {
     const abortController = new AbortController();
     const signal = abortController.signal;
+
+    let closed = false;
+    const onClose = () => {
+      if (closed) return;
+      closed = true;
+      abortController.abort();
+    };
+
+    req.on('aborted', onClose);
+    res.on('close', onClose);
+
     const writeEvent = (payload: unknown) => {
       if (signal.aborted || res.writableEnded || res.destroyed) {
         return;
@@ -31,18 +43,6 @@ export default function createChatRouter(chatService: ChatService, profileServic
       }
     };
 
-    let closed = false;
-    const onClose = () => {
-      if (closed) return;
-      closed = true;
-      abortController.abort();
-    };
-
-    req.on('aborted', onClose);
-    req.on('close', onClose);
-    res.on('close', onClose);
-    res.on('finish', onClose);
-
     try {
       const { content } = req.body as { content?: string };
       if (!content || typeof content !== 'string') {
@@ -53,18 +53,6 @@ export default function createChatRouter(chatService: ChatService, profileServic
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       res.setHeader('X-Accel-Buffering', 'no');
-
-      const writeEvent = (payload: unknown) => {
-        if (signal.aborted || res.writableEnded || res.destroyed) {
-          return;
-        }
-
-        try {
-          res.write(`data: ${JSON.stringify(payload)}\n\n`);
-        } catch {
-          // ignore write errors on closed connections
-        }
-      };
 
       await chatService.sendMessage(
         req.params.sessionId,
@@ -79,40 +67,45 @@ export default function createChatRouter(chatService: ChatService, profileServic
         return;
       }
 
-      const autoAnalysis = await profileService.maybeAnalyzeProfile(
-        req.params.sessionId,
-        (chunk) => writeEvent({ type: 'reasoner_chunk', content: chunk }),
-        {
-          signal,
-          onStarted: () => writeEvent({ type: 'reasoner_started' }),
-        }
-      );
-
-      if (signal.aborted) {
-        return;
-      }
-
-      if (autoAnalysis) {
-        writeEvent({ type: 'profile_updated', data: autoAnalysis.profile });
-        writeEvent({
-          type: 'reasoner_completed',
-          jobId: autoAnalysis.jobId,
-          data: autoAnalysis.revision,
-          reasoningText: autoAnalysis.revision.reasoningText,
-          finalOutputText:
-            autoAnalysis.revision.profileSnapshot.finalOutputText ||
-            autoAnalysis.revision.profileSnapshot.reasoningSummary ||
-            null,
-        });
-      }
-
-      if (signal.aborted) {
-        return;
-      }
-
       writeEvent({ type: 'assistant_done' });
       writeEvent({ type: 'done' });
       res.end();
+
+      // Reasoner runs entirely in the background after chat SSE is closed.
+      // Results are pushed to the persistent reasoner/stream connection.
+      const { sessionId } = req.params;
+      void (async () => {
+        try {
+          const maybeResult = await profileService.maybeAnalyzeProfile(
+            sessionId,
+            (chunk) => {
+              console.log('[reasoner] chunk:', chunk.slice(0, 50));
+              reasonerStreamRegistry.send(sessionId, { type: 'reasoner_chunk', content: chunk });
+            },
+            {
+              onStarted: () => {
+                console.log('[reasoner] started');
+                reasonerStreamRegistry.send(sessionId, { type: 'reasoner_started' });
+              },
+            }
+          );
+
+          if (maybeResult) {
+            reasonerStreamRegistry.send(sessionId, { type: 'profile_updated', data: maybeResult.profile });
+            reasonerStreamRegistry.send(sessionId, {
+              type: 'reasoner_completed',
+              finalOutputText: maybeResult.revision.profileSnapshot.finalOutputText ?? null,
+              reasoningText: maybeResult.revision.reasoningText ?? null,
+            });
+          }
+        } catch (error) {
+          console.error('[reasoner] background task error:', error);
+          reasonerStreamRegistry.send(sessionId, {
+            type: 'error',
+            error: error instanceof Error ? error.message : 'Reasoner failed',
+          });
+        }
+      })();
     } catch (error) {
       if (signal.aborted) {
         return;

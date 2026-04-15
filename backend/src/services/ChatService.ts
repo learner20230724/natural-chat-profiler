@@ -30,10 +30,15 @@ export class ChatService {
   ) {
     const session = await this.runMessageWriteTransaction(sessionId, userMessage);
 
-    const [messageHistory, profile] = await Promise.all([
+    const [rawMessageHistory, profile] = await Promise.all([
       this.messages.listBySession(sessionId),
       this.profiles.findBySessionId(sessionId),
     ]);
+
+    // Filter out incomplete assistant messages to avoid sending empty content to DeepSeek
+    const messageHistory = rawMessageHistory.filter(
+      (m) => !(m.role === 'assistant' && !m.streamCompleted)
+    );
 
     const placeholderAssistantMessage = await this.messages.create({
       sessionId,
@@ -60,6 +65,8 @@ export class ChatService {
           content: assistantContent,
           streamCompleted: false,
         });
+      } else {
+        await this.messages.deleteById(placeholderAssistantMessage.id);
       }
       throw error;
     }

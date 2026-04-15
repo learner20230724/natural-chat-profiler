@@ -40,7 +40,11 @@ export class ProfileService {
     try {
       await connection.beginTransaction();
 
-      const session = await this.ensureSessionExists(sessionId);
+      // Lock the session row inside the transaction to avoid stale reads under concurrency
+      const session = await this.sessions.lockById(sessionId, connection);
+      if (!session) {
+        throw new NotFoundError('Session not found');
+      }
       const allowedKeys = new Set(session.profileFieldDefinitions.map((field) => field.key));
       const normalizedUpdates: Record<string, string | null> = {};
 
@@ -131,7 +135,13 @@ export class ProfileService {
     options?.onStarted?.();
 
     try {
-      const fieldDefinitions = session.profileFieldDefinitions;
+      // Re-read the session immediately before building the prompt so that
+      // field definitions added between the trigger check and now are included.
+      // This fresh snapshot is also passed to the persistence transaction so
+      // that trimProfileValues uses the up-to-date allowedKeys set.
+      const freshSession = (await this.sessions.findById(sessionId)) ?? session;
+      const fieldDefinitions = freshSession.profileFieldDefinitions;
+      console.log('[reasoner] fieldDefinitions:', fieldDefinitions.map(f => f.key));
       const result = await this.aiClient.streamReasoner(
         buildProfileReasonerPrompt(messageHistory, current, fieldDefinitions),
         onReasoningChunk,
@@ -139,7 +149,7 @@ export class ProfileService {
       );
 
       const revision = await this.runReasonerPersistenceTransaction({
-        session,
+        session: freshSession,
         current,
         jobId: job.id,
         result,
@@ -147,29 +157,23 @@ export class ProfileService {
 
       return { jobId: job.id, profile: revision.profile, revision: revision.revision };
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown reasoner error';
+      const failReason = error instanceof Error && error.name === 'AbortError'
+        ? '分析已中止'
+        : (error instanceof Error ? error.message : 'Unknown reasoner error').slice(0, 500);
 
-      if (error instanceof Error && error.name === 'AbortError') {
-        await this.reasonerJobs.markFailed(job.id, '分析已中止');
-        throw error;
+      try {
+        await this.reasonerJobs.markFailed(job.id, failReason);
+      } catch {
+        // ignore markFailed errors to preserve the original error
       }
 
-      await this.reasonerJobs.markFailed(job.id, message.slice(0, 500));
       throw error;
     }
   }
 
   async shouldAutoAnalyze(sessionId: string) {
     const session = await this.ensureSessionExists(sessionId);
-    const hasRunningJob = await this.reasonerJobs.hasRunningJob(sessionId);
-
-    return shouldTriggerReasoner({
-      messageCountSinceReasoner: session.messageCountSinceReasoner,
-      lastReasonerRunAt: session.lastReasonerRunAt,
-      hasRunningJob,
-      messageThreshold: DEFAULT_REASONER_MESSAGE_THRESHOLD,
-      timeThresholdMs: DEFAULT_REASONER_TIME_THRESHOLD_MS,
-    });
+    return this.shouldAutoAnalyzeSession(sessionId, session);
   }
 
   async maybeAnalyzeProfile(
@@ -181,7 +185,7 @@ export class ProfileService {
     }
   ) {
     const session = await this.ensureSessionExists(sessionId);
-    const trigger = await this.shouldAutoAnalyze(sessionId);
+    const trigger = await this.shouldAutoAnalyzeSession(sessionId, session);
 
     if (!trigger) {
       return null;
@@ -192,10 +196,7 @@ export class ProfileService {
         ? 'message_threshold'
         : 'timer';
 
-    return this.analyzeProfile(sessionId, triggerType, onReasoningChunk, {
-      ...options,
-      onStarted: options?.onStarted,
-    });
+    return this.analyzeProfile(sessionId, triggerType, onReasoningChunk, options);
   }
 
   async listJobs(sessionId: string) {
@@ -279,6 +280,21 @@ export class ProfileService {
     }
     return session;
   }
+
+  private async shouldAutoAnalyzeSession(
+    sessionId: string,
+    session: Awaited<ReturnType<ProfileService['ensureSessionExists']>>
+  ) {
+    const hasRunningJob = await this.reasonerJobs.hasRunningJob(sessionId);
+
+    return shouldTriggerReasoner({
+      messageCountSinceReasoner: session.messageCountSinceReasoner,
+      lastReasonerRunAt: session.lastReasonerRunAt,
+      hasRunningJob,
+      messageThreshold: DEFAULT_REASONER_MESSAGE_THRESHOLD,
+      timeThresholdMs: DEFAULT_REASONER_TIME_THRESHOLD_MS,
+    });
+  }
 }
 
 function detectMinorFlag(profile: ProfileSnapshot | null, allowedKeys: Set<string>) {
@@ -300,8 +316,40 @@ function summarizeFinalOutput(finalOutputText: string, fallback: string) {
     return fallback;
   }
 
-  const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
-  const candidate = jsonMatch ? trimmed.replace(jsonMatch[0], '').trim() : trimmed;
+  // Remove all top-level JSON objects using balanced bracket parsing to avoid
+  // the greedy-regex trap of stripping text between the first { and last }.
+  const ranges: Array<[number, number]> = [];
+  let depth = 0;
+  let inString = false;
+  let isEscaped = false;
+  let jsonStart = -1;
+
+  for (let i = 0; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (inString) {
+      if (isEscaped) { isEscaped = false; }
+      else if (ch === '\\') { isEscaped = true; }
+      else if (ch === '"') { inString = false; }
+    } else if (ch === '"') {
+      inString = true;
+    } else if (ch === '{') {
+      if (depth === 0) jsonStart = i;
+      depth++;
+    } else if (ch === '}' && depth > 0) {
+      depth--;
+      if (depth === 0 && jsonStart !== -1) {
+        ranges.push([jsonStart, i + 1]);
+        jsonStart = -1;
+      }
+    }
+  }
+
+  let candidate = trimmed;
+  for (let i = ranges.length - 1; i >= 0; i--) {
+    candidate = candidate.slice(0, ranges[i][0]) + candidate.slice(ranges[i][1]);
+  }
+
+  candidate = candidate.trim();
   return candidate || trimmed.slice(0, 400);
 }
 

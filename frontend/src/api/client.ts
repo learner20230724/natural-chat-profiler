@@ -2,6 +2,7 @@ import type {
   ApiResponse,
   Message,
   ProfileData,
+  ProfileFieldDefinition,
   ProfileRevision,
   ReasonerJob,
   Session,
@@ -260,6 +261,18 @@ export const sessionApi = {
       renamedCount: result.data.renamedCount,
     };
   },
+
+  async updateProfileFieldDefinitions(sessionId: string, definitions: ProfileFieldDefinition[]): Promise<ProfileFieldDefinition[]> {
+    const result = await fetchJson<ApiResponse<ProfileFieldDefinition[]>>(
+      `${API_BASE_URL}/sessions/${sessionId}/profile-fields`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(definitions),
+      }
+    );
+    return result.data;
+  },
 };
 
 function collectSseData(eventBlock: string) {
@@ -302,12 +315,9 @@ export const messageApi = {
     sessionId: string,
     content: string,
     onChunk: (chunk: string) => void,
+    onChatComplete: () => void,
     onComplete: () => void,
     onError: (error: Error) => void,
-    onProfileUpdate?: (profileData: ProfileData) => void,
-    onReasoningChunk?: (chunk: string) => void,
-    onReasoningStart?: () => void,
-    onReasoningComplete?: (finalOutputText: string | null, reasoningText?: string | null) => void,
     onAbort?: () => void,
     abortController?: AbortController
   ): AbortController {
@@ -353,6 +363,23 @@ export const messageApi = {
 
         let buffer = '';
 
+        // Returns true when the terminal 'done' event is received (caller should return).
+        // Throws on 'error' events.
+        const processEvent = (parsed: NonNullable<ReturnType<typeof parseSsePayload>>): boolean => {
+          if (parsed.type === 'assistant_chunk' && parsed.content) {
+            onChunk(parsed.content);
+          } else if (parsed.type === 'assistant_done') {
+            onChatComplete();
+          } else if (parsed.type === 'done') {
+            sawTerminalEvent = true;
+            finish();
+            return true;
+          } else if (parsed.type === 'error') {
+            throw new ApiClientError(parsed.error || parsed.content || 'Unknown error');
+          }
+          return false;
+        };
+
         while (true) {
           const { done, value } = await reader.read();
           if (done) {
@@ -365,50 +392,13 @@ export const messageApi = {
 
           for (const eventBlock of eventBlocks) {
             const parsed = parseSsePayload(eventBlock);
-            if (!parsed) {
-              continue;
-            }
-
-            if (parsed.type === 'assistant_chunk' && parsed.content) {
-              onChunk(parsed.content);
-            } else if (parsed.type === 'reasoner_started') {
-              onReasoningStart?.();
-            } else if (parsed.type === 'reasoner_chunk' && parsed.content) {
-              onReasoningChunk?.(parsed.content);
-            } else if (parsed.type === 'profile_updated' && parsed.data) {
-              onProfileUpdate?.(mapProfileData(parsed.data as Parameters<typeof mapProfileData>[0]));
-            } else if (parsed.type === 'reasoner_completed') {
-              onReasoningComplete?.(parsed.finalOutputText ?? null, parsed.reasoningText ?? null);
-            } else if (parsed.type === 'assistant_done' || parsed.type === 'done') {
-              sawTerminalEvent = true;
-              finish();
-              return;
-            } else if (parsed.type === 'error') {
-              throw new ApiClientError(parsed.error || parsed.content || 'Unknown error');
-            }
+            if (!parsed) continue;
+            if (processEvent(parsed)) return;
           }
         }
 
         const tailPayload = parseSsePayload(buffer);
-        if (tailPayload) {
-          if (tailPayload.type === 'assistant_chunk' && tailPayload.content) {
-            onChunk(tailPayload.content);
-          } else if (tailPayload.type === 'reasoner_started') {
-            onReasoningStart?.();
-          } else if (tailPayload.type === 'reasoner_chunk' && tailPayload.content) {
-            onReasoningChunk?.(tailPayload.content);
-          } else if (tailPayload.type === 'profile_updated' && tailPayload.data) {
-            onProfileUpdate?.(mapProfileData(tailPayload.data as Parameters<typeof mapProfileData>[0]));
-          } else if (tailPayload.type === 'reasoner_completed') {
-            onReasoningComplete?.(tailPayload.finalOutputText ?? null, tailPayload.reasoningText ?? null);
-          } else if (tailPayload.type === 'assistant_done' || tailPayload.type === 'done') {
-            sawTerminalEvent = true;
-            finish();
-            return;
-          } else if (tailPayload.type === 'error') {
-            throw new ApiClientError(tailPayload.error || tailPayload.content || 'Unknown error');
-          }
-        }
+        if (tailPayload && processEvent(tailPayload)) return;
 
         if (!sawTerminalEvent) {
           throw new ApiClientError('流式响应异常结束');
@@ -420,6 +410,73 @@ export const messageApi = {
         }
 
         onError(error instanceof Error ? error : new Error('Unknown error occurred'));
+      }
+    })();
+
+    return controller;
+  },
+
+  connectReasonerStream(
+    sessionId: string,
+    onReasoningStart: () => void,
+    onReasoningChunk: (chunk: string) => void,
+    onReasoningComplete: (finalOutputText: string | null, reasoningText: string | null) => void,
+    onProfileUpdate: (profileData: ProfileData) => void,
+    onError: (error: string) => void
+  ): AbortController {
+    const controller = new AbortController();
+
+    void (async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/reasoner/stream`, {
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          onError(`HTTP ${response.status}: ${response.statusText}`);
+          return;
+        }
+
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+        if (!reader) {
+          onError('Response body is not readable');
+          return;
+        }
+
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const eventBlocks = buffer.split(/\r?\n\r?\n/);
+          buffer = eventBlocks.pop() || '';
+
+          for (const eventBlock of eventBlocks) {
+            const parsed = parseSsePayload(eventBlock);
+            if (!parsed) continue;
+
+            if (parsed.type === 'reasoner_started') {
+              onReasoningStart();
+            } else if (parsed.type === 'reasoner_chunk' && parsed.content) {
+              onReasoningChunk(parsed.content);
+            } else if (parsed.type === 'reasoner_completed') {
+              onReasoningComplete(parsed.finalOutputText ?? null, parsed.reasoningText ?? null);
+            } else if (parsed.type === 'profile_updated' && parsed.data) {
+              onProfileUpdate(mapProfileData(parsed.data as Parameters<typeof mapProfileData>[0]));
+            } else if (parsed.type === 'error') {
+              onError(parsed.error || 'Unknown reasoner error');
+            }
+            // 'connected' and unknown types are silently ignored
+          }
+        }
+      } catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') {
+          return; // intentional disconnect, not an error
+        }
+        onError(error instanceof Error ? error.message : 'Reasoner stream error');
       }
     })();
 

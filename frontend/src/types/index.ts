@@ -122,7 +122,6 @@ export interface AppState {
   profileData: ProfileData;
   profileFieldDefinitions: ProfileFieldDefinition[];
   loading: LoadingState;
-  isLoading: boolean;
   isStreaming: boolean;
   activeStreamCount: number;
   error: string | null;

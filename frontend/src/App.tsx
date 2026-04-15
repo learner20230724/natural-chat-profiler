@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { useAppContext } from './context/AppContext';
 import { useApi } from './hooks/useApi';
+import { useSessionInit } from './hooks/useSessionInit';
+import type { ProfileFieldDefinition } from './types';
 import {
   ChatPanel,
   ExportButton,
@@ -10,18 +12,12 @@ import {
   SessionList,
 } from './components';
 
-const MIN_INIT_DURATION_MS = 400;
-
 function App() {
   const { state, setError } = useAppContext();
   const [mobileTab, setMobileTab] = useState<'chat' | 'profile' | 'reasoning'>('chat');
-  const [shouldAutoCreateSession, setShouldAutoCreateSession] = useState(true);
-  const [isInitComplete, setIsInitComplete] = useState(false);
   const [isMobileSessionOpen, setIsMobileSessionOpen] = useState(false);
   const [showClearDataConfirm, setShowClearDataConfirm] = useState(false);
   const [clearDataSuccessMessage, setClearDataSuccessMessage] = useState<string | null>(null);
-  const initialCreateInFlightRef = useRef(false);
-  const activeStreamControllerRef = useRef<AbortController | null>(null);
 
   const {
     loadSessions,
@@ -33,94 +29,24 @@ function App() {
     sendMessage,
     abortCurrentStream,
     updateProfileField,
+    updateProfileFieldDefinitions,
     exportPDF,
   } = useApi();
+
+  const { isInitComplete, setShouldAutoCreateSession } = useSessionInit({
+    loadSessions,
+    createSession,
+    organizeSessions,
+    setError,
+    currentSessionId: state.currentSessionId,
+    isCreatingSession: state.loading.creatingSession,
+  });
 
   const isInitialSessionLoading = state.loading.sessions || state.loading.sessionDetail;
   const isCreatingSession = state.loading.creatingSession;
   const isClearingAllData = state.loading.clearingAllData;
   const isExportingPdf = state.loading.exportingPdf;
   const deletingSessionId = state.loading.deletingSessionId;
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const initApp = async () => {
-      const startTime = Date.now();
-
-      try {
-        const sessions = await loadSessions();
-
-        if (!cancelled && sessions.length > 0) {
-          try {
-            await loadSession(sessions[0].id);
-          } catch {
-            // ignore auto-load failure
-          }
-        }
-      } catch {
-        // 静默忽略加载会话错误
-      }
-
-      const elapsed = Date.now() - startTime;
-      const remaining = Math.max(0, MIN_INIT_DURATION_MS - elapsed);
-      if (remaining > 0) {
-        await new Promise((resolve) => setTimeout(resolve, remaining));
-      }
-
-      if (!cancelled) {
-        setIsInitComplete(true);
-      }
-
-      void organizeSessions().catch(() => {
-        // 静默忽略组织会话错误，不阻塞首屏
-      });
-    };
-
-    void initApp();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [loadSessions, loadSession, organizeSessions]);
-
-  useEffect(() => {
-    if (!isInitComplete) return;
-
-    if (
-      initialCreateInFlightRef.current ||
-      state.currentSessionId ||
-      state.sessions.length > 0 ||
-      isCreatingSession ||
-      !shouldAutoCreateSession
-    ) {
-      return;
-    }
-
-    initialCreateInFlightRef.current = true;
-    createSession()
-      .catch((error) => {
-        console.error('Failed to create initial session:', error);
-        setError('自动创建会话失败，请手动新建');
-      })
-      .finally(() => {
-        initialCreateInFlightRef.current = false;
-      });
-  }, [
-    isInitComplete,
-    state.currentSessionId,
-    isCreatingSession,
-    state.sessions.length,
-    shouldAutoCreateSession,
-    createSession,
-    setError,
-  ]);
-
-  useEffect(() => {
-    if (!state.isStreaming) {
-      activeStreamControllerRef.current = null;
-    }
-  }, [state.isStreaming]);
 
   const confirmAbortIfStreaming = useCallback(async () => {
     if (!state.isStreaming) return true;
@@ -146,8 +72,7 @@ function App() {
       return;
     }
 
-    const controller = sendMessage(state.currentSessionId, content);
-    activeStreamControllerRef.current = controller;
+    sendMessage(state.currentSessionId, content);
   };
 
   const handleSelectSession = async (sessionId: string) => {
@@ -212,18 +137,28 @@ function App() {
   };
 
   const handleClearAllData = async () => {
+    setShouldAutoCreateSession(false);
     try {
-      setShouldAutoCreateSession(false);
       await clearAllData();
-      await loadSessions();
-      setClearDataSuccessMessage('所有本地会话与画像数据已清除。');
-      setShowClearDataConfirm(false);
-      setIsMobileSessionOpen(false);
     } catch (error) {
+      // clearAllData failed — restore auto-create so the user isn't left with an empty UI
+      setShouldAutoCreateSession(true);
       console.error('Failed to clear all data:', error);
       setError('清除数据失败，请重试');
       throw error;
     }
+
+    try {
+      await loadSessions();
+    } catch {
+      // Sessions were cleared successfully; loadSessions failing is non-critical.
+      // Allow auto-create so user can start a fresh session.
+      setShouldAutoCreateSession(true);
+    }
+
+    setClearDataSuccessMessage('所有本地会话与画像数据已清除。');
+    setShowClearDataConfirm(false);
+    setIsMobileSessionOpen(false);
   };
 
   const handleDismissError = () => {
@@ -241,6 +176,17 @@ function App() {
       await updateProfileField(state.currentSessionId, field, value);
     } catch (error) {
       console.error('Failed to update profile field:', error);
+      throw error;
+    }
+  };
+
+  const handleUpdateProfileFieldDefinitions = async (definitions: ProfileFieldDefinition[]) => {
+    if (!state.currentSessionId) return;
+
+    try {
+      await updateProfileFieldDefinitions(state.currentSessionId, definitions);
+    } catch (error) {
+      console.error('Failed to update profile field definitions:', error);
       throw error;
     }
   };
@@ -379,6 +325,7 @@ function App() {
               fieldDefinitions={state.profileFieldDefinitions}
               isUpdating={state.profileData.isReasoningStreaming}
               onUpdateField={handleUpdateProfileField}
+              onUpdateFieldDefinitions={handleUpdateProfileFieldDefinitions}
             />
           </div>
 

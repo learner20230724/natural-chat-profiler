@@ -6,6 +6,7 @@ import { PrivacyEventRepository } from '../infrastructure/repositories/PrivacyEv
 import { SessionTitleService } from './SessionTitleService';
 import { NotFoundError } from '../shared/errors';
 import { ProfileFieldDefinition } from '../types';
+import { DEFAULT_REASONER_MESSAGE_THRESHOLD } from '../domain/reasonerPolicy';
 
 const AUTO_DELETE_EMPTY_SESSION_GRACE_MS = 60 * 1000;
 
@@ -169,6 +170,9 @@ export class SessionService {
     }
 
     await this.sessions.updateProfileFields(sessionId, definitions);
+    // Ensure the reasoner fires on the very next message so it immediately
+    // incorporates any newly added or removed fields.
+    await this.sessions.forceReasonerOnNextMessage(sessionId, DEFAULT_REASONER_MESSAGE_THRESHOLD);
     return definitions;
   }
 }

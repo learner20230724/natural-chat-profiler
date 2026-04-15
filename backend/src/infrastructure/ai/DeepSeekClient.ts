@@ -179,6 +179,13 @@ export class DeepSeekClient {
       }
     } finally {
       reader.releaseLock();
+      if (options?.signal?.aborted) {
+        response.body?.cancel().catch(() => undefined);
+      }
+    }
+
+    if (!content.trim()) {
+      throw new Error('Reasoner returned empty output — skipping profile update');
     }
 
     return {
@@ -228,6 +235,9 @@ export class DeepSeekClient {
       }
     } finally {
       reader.releaseLock();
+      if (signal?.aborted) {
+        body.cancel().catch(() => undefined);
+      }
     }
 
     return fullContent;
@@ -235,7 +245,7 @@ export class DeepSeekClient {
 
   private async fetchWithTimeout(input: string, init: RequestInit, timeoutMs?: number) {
     const timeoutController = new AbortController();
-    const mergedSignal = mergeSignals(init.signal, timeoutController.signal);
+    const { signal, dispose } = mergeSignals(init.signal, timeoutController.signal);
 
     const timer = setTimeout(() => {
       timeoutController.abort();
@@ -244,35 +254,53 @@ export class DeepSeekClient {
     try {
       return await fetch(input, {
         ...init,
-        signal: mergedSignal,
+        signal,
       });
     } finally {
       clearTimeout(timer);
+      dispose();
     }
   }
 }
 
 function mergeSignals(a?: AbortSignal | null, b?: AbortSignal | null) {
-  if (!a && !b) return undefined;
-  if (a && !b) return a;
-  if (!a && b) return b;
+  if (!a && !b) {
+    return { signal: undefined, dispose: () => undefined };
+  }
+  if (a && !b) {
+    return { signal: a, dispose: () => undefined };
+  }
+  if (!a && b) {
+    return { signal: b, dispose: () => undefined };
+  }
 
   const controller = new AbortController();
   const signals = [a!, b!];
 
-  const onAbort = () => {
+  // Check all signals before registering any listeners to avoid partial-registration leaks
+  if (signals.some((s) => s.aborted)) {
     controller.abort();
-  };
+    return { signal: controller.signal, dispose: () => undefined };
+  }
+
+  const listeners = new Map<AbortSignal, () => void>();
 
   for (const signal of signals) {
-    if (signal.aborted) {
+    const onAbort = () => {
       controller.abort();
-      break;
-    }
+    };
+    listeners.set(signal, onAbort);
     signal.addEventListener('abort', onAbort, { once: true });
   }
 
-  return controller.signal;
+  const dispose = () => {
+    for (const [signal, listener] of listeners) {
+      signal.removeEventListener('abort', listener);
+    }
+    listeners.clear();
+  };
+
+  return { signal: controller.signal, dispose };
 }
 
 function abortError() {

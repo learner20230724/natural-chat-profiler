@@ -43,7 +43,13 @@ export function ReasoningPanel({
 
   useEffect(() => {
     if (isStreaming) {
-      setCurrentIndex(streamingVirtualIndex);
+      // Only auto-jump to the live stream if the user was already on the latest
+      // item (or there is no history yet). If they are browsing an older entry,
+      // leave them there so they can finish reading.
+      const wasAtLatest = reasoningHistory.length === 0 || currentIndex >= reasoningHistory.length - 1;
+      if (wasAtLatest) {
+        setCurrentIndex(streamingVirtualIndex);
+      }
     } else if (currentIndex >= streamingVirtualIndex && reasoningHistory.length > 0) {
       setCurrentIndex(reasoningHistory.length - 1);
     }
@@ -206,7 +212,7 @@ export function ReasoningPanel({
                     ←
                   </button>
                   <span className="text-sm text-gray-600 min-w-[60px] text-center">
-                    {Math.min(currentIndex + 1, reasoningHistory.length)} / {reasoningHistory.length}
+                    {Math.min(currentIndex + 1, reasoningHistory.length)} / {isStreaming ? reasoningHistory.length + 1 : reasoningHistory.length}
                   </span>
                   <button
                     onClick={handleNext}
@@ -236,20 +242,18 @@ export function ReasoningPanel({
         onScroll={updateAutoScrollState}
         className="flex-1 min-h-0 overflow-y-auto px-6 py-5 bg-gradient-to-b from-amber-50/40 via-white to-white"
       >
-        {displayReasoningText ? (
+        {isStreaming || displayReasoningText ? (
           <div className="rounded-2xl border border-amber-100 bg-amber-50/70 p-4 shadow-sm">
             <div className="flex items-center gap-2 mb-3">
               <span className="text-xs font-medium text-amber-700 uppercase tracking-wide">思考过程</span>
             </div>
             <div className="whitespace-pre-wrap text-gray-700 leading-7 text-sm">
-              {displayReasoningText}
+              {displayReasoningText || ''}
               {isStreaming && <span className="inline-block w-2 h-4 bg-amber-500 ml-1 animate-pulse rounded-sm" />}
             </div>
-          </div>
-        ) : isStreaming ? (
-          <div className="flex flex-col items-center justify-center h-full text-gray-400">
-            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-amber-500 mb-3"></div>
-            <p className="text-sm">等待思考过程...</p>
+            {isStreaming && !displayReasoningText && (
+              <div className="text-gray-400 text-sm italic mt-2">正在接收思考内容...</div>
+            )}
           </div>
         ) : (
           <div className="flex flex-col items-center justify-center h-full text-gray-400">

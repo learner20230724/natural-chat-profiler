@@ -81,6 +81,10 @@ export class MessageRepository {
     );
   }
 
+  async deleteById(id: string) {
+    await this.pool.query('DELETE FROM session_messages WHERE id = ?', [id]);
+  }
+
   async countBySession(sessionId: string) {
     const [rows] = await this.pool.query<mysql.RowDataPacket[]>(
       'SELECT COUNT(*) AS count FROM session_messages WHERE session_id = ?',

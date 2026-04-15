@@ -7,9 +7,13 @@ import createSessionsRouter from '../routes/sessions';
 import createChatRouter from '../routes/chat';
 import createProfileRouter from '../routes/profile';
 import createExportRouter from '../routes/export';
+import createReasonerRouter from '../routes/reasoner';
 
 export function createApp(container: AppContainer): Express {
   const app = express();
+
+  // Disable ETag caching so GET responses always reflect the latest DB state.
+  app.set('etag', false);
 
   app.use(
     cors({
@@ -23,10 +27,10 @@ export function createApp(container: AppContainer): Express {
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok' });
   });
-
   app.use('/api/sessions', createSessionsRouter(container.services.sessionService));
   app.use('/api/sessions', createChatRouter(container.services.chatService, container.services.profileService));
   app.use('/api/sessions', createProfileRouter(container.services.profileService));
+  app.use('/api/sessions', createReasonerRouter());
   app.use(
     '/api/sessions',
     createExportRouter(

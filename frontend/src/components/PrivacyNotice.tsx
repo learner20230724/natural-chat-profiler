@@ -57,7 +57,7 @@ export function PrivacyNotice({
 
           <div className="rounded-2xl bg-amber-50 px-4 py-3 ring-1 ring-amber-100">
             <h3 className="font-semibold text-amber-900 mb-2">数据控制</h3>
-            <p className="leading-6">您可以随时删除单个会话或清除所有数据。删除操作将从数据库中完全移除相关信息。</p>
+            <p className="leading-6">您可以随时删除单个会话或清除所有数据。删除单个会话会将其标记为已删除并清理隐私状态，清除所有数据会从数据库中移除全部会话信息。</p>
           </div>
 
           <div className="rounded-2xl bg-red-50/70 px-4 py-4 ring-1 ring-red-100">

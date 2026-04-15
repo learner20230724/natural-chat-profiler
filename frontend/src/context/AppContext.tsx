@@ -28,7 +28,6 @@ type AppAction =
   | { type: 'SET_PROFILE_DATA'; payload: ProfileData | null }
   | { type: 'MERGE_PROFILE_DATA'; payload: Partial<ProfileData> | null }
   | { type: 'SET_PROFILE_FIELDS'; payload: ProfileFieldDefinition[] }
-  | { type: 'MERGE_PROFILE_FIELDS'; payload: ProfileFieldDefinition[] }
   | { type: 'RESET_SESSION' };
 
 const emptyProfile: ProfileData = {
@@ -58,7 +57,6 @@ const initialState: AppState = {
     exportingPdf: false,
     analyzingProfile: false,
   },
-  isLoading: false,
   isStreaming: false,
   activeStreamCount: 0,
   error: null,
@@ -71,10 +69,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
         ...state.loading,
         ...action.payload,
       };
-      const isLoading = Object.values(nextLoading).some((value) =>
-        typeof value === 'boolean' ? value : value !== null
-      );
-      return { ...state, loading: nextLoading, isLoading };
+      return { ...state, loading: nextLoading };
     }
     case 'START_STREAMING': {
       const nextActiveStreamCount = state.activeStreamCount + 1;
@@ -131,19 +126,21 @@ function appReducer(state: AppState, action: AppAction): AppState {
         ...state,
         messages: state.messages.filter((message) => !action.payload.includes(message.id)),
       };
-    case 'APPEND_MESSAGE_CONTENT':
+    case 'APPEND_MESSAGE_CONTENT': {
+      const idx = state.messages.findIndex((m) => m.id === action.payload.messageId);
+      if (idx === -1) return state;
+      const target = state.messages[idx];
       return {
         ...state,
-        messages: state.messages.map((message) =>
-          message.id === action.payload.messageId
-            ? {
-                ...message,
-                content: message.content + action.payload.chunk,
-              }
-            : message
-        ),
+        messages: [
+          ...state.messages.slice(0, idx),
+          { ...target, content: target.content + action.payload.chunk },
+          ...state.messages.slice(idx + 1),
+        ],
       };
+    }
     case 'START_PROFILE_REASONING':
+      console.log('[AppContext] START_PROFILE_REASONING');
       return {
         ...state,
         profileData: {
@@ -153,6 +150,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
         },
       };
     case 'UPDATE_PROFILE_REASONING':
+      console.log('[AppContext] UPDATE_PROFILE_REASONING, chunk length:', action.payload.length);
       return {
         ...state,
         profileData: {
@@ -186,11 +184,6 @@ function appReducer(state: AppState, action: AppAction): AppState {
       };
     }
     case 'SET_PROFILE_FIELDS':
-      return {
-        ...state,
-        profileFieldDefinitions: action.payload,
-      };
-    case 'MERGE_PROFILE_FIELDS':
       return {
         ...state,
         profileFieldDefinitions: action.payload,
@@ -255,7 +248,6 @@ interface AppContextValue {
   setProfileData: (profileData: ProfileData | null) => void;
   mergeProfileData: (profileData: Partial<ProfileData> | null) => void;
   setProfileFields: (definitions: ProfileFieldDefinition[]) => void;
-  mergeProfileFields: (definitions: ProfileFieldDefinition[]) => void;
   resetSession: () => void;
 }
 
@@ -344,10 +336,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     dispatch({ type: 'SET_PROFILE_FIELDS', payload: definitions });
   }, []);
 
-  const mergeProfileFields = useCallback((definitions: ProfileFieldDefinition[]) => {
-    dispatch({ type: 'MERGE_PROFILE_FIELDS', payload: definitions });
-  }, []);
-
   const resetSession = useCallback(() => {
     dispatch({ type: 'RESET_SESSION' });
   }, []);
@@ -375,7 +363,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setProfileData,
         mergeProfileData,
         setProfileFields,
-        mergeProfileFields,
         resetSession,
       }}
     >

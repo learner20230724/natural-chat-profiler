@@ -10,8 +10,8 @@ interface ProfileRow extends mysql.RowDataPacket {
   current_city: string | null;
   personality: string | null;
   expectations: string | null;
-  profile_json: string | null;
-  confidence_json: string | null;
+  profile_json: string | Record<string, unknown> | null;
+  confidence_json: string | Record<string, unknown> | null;
   reasoning_summary: string | null;
   updated_at: Date;
   version: number;
@@ -116,9 +116,13 @@ export class ProfileRepository {
   }
 }
 
-function safeJsonParse(value: string | null | undefined): unknown | null {
+function safeJsonParse(value: string | Record<string, unknown> | null | undefined): unknown | null {
   if (!value) {
     return null;
+  }
+
+  if (typeof value === 'object') {
+    return value;
   }
 
   try {

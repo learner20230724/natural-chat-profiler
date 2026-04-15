@@ -7,7 +7,7 @@ import {
   exportApi,
   ApiClientError,
 } from '../api/client';
-import type { Message, ProfileData } from '../types';
+import type { Message, ProfileData, ProfileFieldDefinition } from '../types';
 
 export function useApi() {
   const {
@@ -35,6 +35,7 @@ export function useApi() {
 
   // Streaming / send queue (global)
   const currentStreamControllerRef = useRef<AbortController | null>(null);
+  const reasonerStreamControllerRef = useRef<AbortController | null>(null);
   const currentSessionIdRef = useRef<string | null>(null);
   const latestLoadSessionRequestRef = useRef(0);
   const latestStreamGenerationRef = useRef(0);
@@ -55,6 +56,38 @@ export function useApi() {
     const { reasoningHistory: _ignored, ...rest } = profileData;
     return rest as Partial<ProfileData>;
   }, []);
+
+  const connectReasonerStream = useCallback(
+    (sessionId: string) => {
+      // Disconnect any existing reasoner stream.
+      reasonerStreamControllerRef.current?.abort();
+
+      const controller = messageApi.connectReasonerStream(
+        sessionId,
+        () => {
+          if (currentSessionIdRef.current !== sessionId) return;
+          startProfileReasoning();
+        },
+        (chunk) => {
+          if (currentSessionIdRef.current !== sessionId) return;
+          updateProfileReasoning(chunk);
+        },
+        (finalOutputText, reasoningText) => {
+          if (currentSessionIdRef.current !== sessionId) return;
+          completeProfileReasoning(finalOutputText, reasoningText);
+        },
+        (profileData) => {
+          if (currentSessionIdRef.current !== sessionId) return;
+          mergeProfileData(mapProfileMerge(profileData));
+        },
+        (error) => {
+          console.warn('[reasoner stream] error:', error);
+        }
+      );
+      reasonerStreamControllerRef.current = controller;
+    },
+    [startProfileReasoning, updateProfileReasoning, completeProfileReasoning, mergeProfileData, mapProfileMerge]
+  );
 
   const abortCurrentStream = useCallback(() => {
     // Abort only the active stream; clear any queued sends to avoid unexpected sends after abort
@@ -81,6 +114,7 @@ export function useApi() {
       resetSession();
       addSession(session);
       setCurrentSession(session.id);
+      connectReasonerStream(session.id);
 
       try {
         const sessionDetail = await sessionApi.getSession(session.id);
@@ -120,7 +154,7 @@ export function useApi() {
     } finally {
       setLoading({ creatingSession: false });
     }
-  }, [setLoading, setError, resetSession, addSession, setCurrentSession, setMessages, setProfileFields, setProfileData]);
+  }, [setLoading, setError, resetSession, addSession, setCurrentSession, setMessages, setProfileFields, setProfileData, connectReasonerStream]);
 
   const loadSessions = useCallback(async () => {
     try {
@@ -161,6 +195,7 @@ export function useApi() {
         setCurrentSession(sessionId);
         setMessages(sessionDetail.messages);
         setProfileFields(sessionDetail.profileFieldDefinitions ?? []);
+        connectReasonerStream(sessionId);
 
         try {
           const profileData = await profileApi.getProfileData(sessionId);
@@ -187,7 +222,7 @@ export function useApi() {
         }
       }
     },
-    [setLoading, setError, setCurrentSession, setMessages, setProfileFields, setProfileData]
+    [setLoading, setError, setCurrentSession, setMessages, setProfileFields, setProfileData, connectReasonerStream]
   );
 
   const deleteSession = useCallback(
@@ -285,6 +320,8 @@ export function useApi() {
         const controller = new AbortController();
         currentStreamControllerRef.current = controller;
 
+        let chatCompleted = false;
+
         const isActive = () => (
           latestStreamGenerationRef.current === generation &&
           currentSessionIdRef.current === targetSessionId &&
@@ -321,34 +358,26 @@ export function useApi() {
             appendMessageContent(assistantMessageId, chunk);
           },
           () => {
+            // assistant_done: chat reply is complete; mark message and release streaming state
             if (!isActive()) return;
+            chatCompleted = true;
             updateMessage(assistantMessageId, { uiStatus: undefined, streamCompleted: true });
             completeStreaming();
+          },
+          () => {
+            // done: chat SSE closed; finalize and drain queue
+            if (!isActive()) return;
             finalize();
           },
           (error) => {
             if (!isActive()) return;
-            updateMessage(assistantMessageId, { uiStatus: 'error' });
-            completeStreaming();
+            if (!chatCompleted) {
+              updateMessage(assistantMessageId, { uiStatus: 'error' });
+              completeStreaming();
+            }
             finalize();
             const errorMessage = error instanceof ApiClientError ? error.message : '发送失败，请重试';
             setError(errorMessage === '流式响应异常结束' ? '流式响应异常结束，请重试' : errorMessage);
-          },
-          (profileData) => {
-            if (!isActive()) return;
-            mergeProfileData(mapProfileMerge(profileData));
-          },
-          (reasoningChunk) => {
-            if (!isActive()) return;
-            updateProfileReasoning(reasoningChunk);
-          },
-          () => {
-            if (!isActive()) return;
-            startProfileReasoning();
-          },
-          (finalOutputText, reasoningText) => {
-            if (!isActive()) return;
-            completeProfileReasoning(finalOutputText, reasoningText);
           },
           () => {
             if (!isActive() && currentStreamControllerRef.current !== controller) return;
@@ -358,7 +387,6 @@ export function useApi() {
             });
             appendMessageContent(assistantMessageId, '当前回复已中止，排队消息已清空。');
             completeStreaming();
-            completeProfileReasoning();
             finalize();
           },
           controller
@@ -372,15 +400,10 @@ export function useApi() {
     [
       addMessage,
       appendMessageContent,
-      completeProfileReasoning,
       completeStreaming,
-      mapProfileMerge,
-      mergeProfileData,
       setError,
-      startProfileReasoning,
       startStreaming,
       updateMessage,
-      updateProfileReasoning,
     ]
   );
   const loadProfileData = useCallback(
@@ -435,6 +458,24 @@ export function useApi() {
     [setError, mergeProfileData]
   );
 
+  const updateProfileFieldDefinitions = useCallback(
+    async (sessionId: string, definitions: ProfileFieldDefinition[]) => {
+      try {
+        setError(null);
+        const updated = await sessionApi.updateProfileFieldDefinitions(sessionId, definitions);
+        if (currentSessionIdRef.current === sessionId) {
+          setProfileFields(updated);
+        }
+        return updated;
+      } catch (error) {
+        const errorMessage = error instanceof ApiClientError ? error.message : '更新字段定义失败';
+        setError(errorMessage);
+        throw error;
+      }
+    },
+    [setError, setProfileFields]
+  );
+
   const exportPDF = useCallback(
     async (sessionId: string, filename?: string) => {
       try {
@@ -475,6 +516,7 @@ export function useApi() {
     loadProfileData,
     analyzeProfile,
     updateProfileField,
+    updateProfileFieldDefinitions,
     exportPDF,
     abortCurrentStream,
   };

@@ -1,10 +1,4 @@
-/**
- * ProfilePanel Component
- * Displays extracted user profile information in a table format
- * Updates in real-time as information is extracted from conversations
- */
-
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ProfileData, ProfileFieldDefinition } from '../types';
 
 interface ProfilePanelProps {
@@ -12,6 +6,7 @@ interface ProfilePanelProps {
   fieldDefinitions: ProfileFieldDefinition[];
   isUpdating?: boolean;
   onUpdateField?: (field: string, value: string) => Promise<void> | void;
+  onUpdateFieldDefinitions?: (definitions: ProfileFieldDefinition[]) => Promise<void> | void;
 }
 
 export function ProfilePanel({
@@ -19,13 +14,19 @@ export function ProfilePanel({
   fieldDefinitions,
   isUpdating = false,
   onUpdateField,
+  onUpdateFieldDefinitions,
 }: ProfilePanelProps) {
   const [highlightedFields, setHighlightedFields] = useState<Set<string>>(new Set());
-  const [previousValues, setPreviousValues] = useState<Record<string, string | null>>(profileData.values);
+  const previousValuesRef = useRef<Record<string, string | null>>(profileData.values);
   const [editingField, setEditingField] = useState<string | null>(null);
   const [editValue, setEditValue] = useState('');
   const [savingField, setSavingField] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string | null>>({});
+
+  const [isManagingFields, setIsManagingFields] = useState(false);
+  const [newFieldLabel, setNewFieldLabel] = useState('');
+  const [addFieldError, setAddFieldError] = useState<string | null>(null);
+  const [savingDefinitions, setSavingDefinitions] = useState(false);
 
   const resolvedFields = useMemo(() => {
     if (fieldDefinitions.length > 0) {
@@ -45,20 +46,20 @@ export function ProfilePanel({
 
     resolvedFields.forEach(({ key }) => {
       const nextValue = profileData.values[key];
-      const previousValue = previousValues[key];
+      const previousValue = previousValuesRef.current[key];
       if (nextValue !== previousValue && nextValue !== null) {
         changedFields.add(key);
       }
     });
 
-    setPreviousValues(profileData.values);
+    previousValuesRef.current = profileData.values;
 
     if (changedFields.size > 0) {
       setHighlightedFields(changedFields);
       const timer = setTimeout(() => setHighlightedFields(new Set()), 2000);
       return () => clearTimeout(timer);
     }
-  }, [profileData.values, previousValues, resolvedFields]);
+  }, [profileData.values, resolvedFields]);
 
   const formatLastUpdated = (date: Date | null): string => {
     if (!date) return '暂无更新';
@@ -142,12 +143,112 @@ export function ProfilePanel({
 
   const hasFields = resolvedFields.length > 0;
 
+  const addField = async () => {
+    const label = newFieldLabel.trim();
+    if (!label) {
+      setAddFieldError('字段名称不能为空');
+      return;
+    }
+    const key = `field_${Date.now()}`;
+    if (resolvedFields.some((f) => f.key === key)) {
+      setAddFieldError('请重试');
+      return;
+    }
+    const newDefs: ProfileFieldDefinition[] = [
+      ...resolvedFields,
+      { key, label, placeholder: null, promptHint: null },
+    ];
+    try {
+      setSavingDefinitions(true);
+      setAddFieldError(null);
+      await onUpdateFieldDefinitions?.(newDefs);
+      setNewFieldLabel('');
+    } catch {
+      setAddFieldError('保存失败，请重试');
+    } finally {
+      setSavingDefinitions(false);
+    }
+  };
+
+  const deleteField = async (key: string) => {
+    const newDefs = resolvedFields.filter((f) => f.key !== key);
+    if (newDefs.length === 0) {
+      return; // keep at least one field
+    }
+    try {
+      setSavingDefinitions(true);
+      await onUpdateFieldDefinitions?.(newDefs);
+    } catch {
+      // ignore
+    } finally {
+      setSavingDefinitions(false);
+    }
+  };
+
   return (
     <div className="flex flex-col h-full bg-white rounded-lg shadow-sm border border-gray-200">
       <div className="px-6 py-4 border-b border-gray-200 flex-shrink-0">
-        <h2 className="text-xl font-semibold text-gray-800">用户信息表格</h2>
-        <p className="text-sm text-gray-500 mt-1">{formatLastUpdated(profileData.lastUpdated)}</p>
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-xl font-semibold text-gray-800">用户信息表格</h2>
+            <p className="text-sm text-gray-500 mt-1">{formatLastUpdated(profileData.lastUpdated)}</p>
+          </div>
+          {onUpdateFieldDefinitions && (
+            <button
+              type="button"
+              onClick={() => setIsManagingFields((v) => !v)}
+              className={`px-3 py-1.5 text-sm rounded-lg border transition-colors ${
+                isManagingFields
+                  ? 'bg-blue-500 text-white border-blue-500'
+                  : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'
+              }`}
+            >
+              管理字段
+            </button>
+          )}
+        </div>
       </div>
+
+      {isManagingFields && onUpdateFieldDefinitions && (
+        <div className="px-6 py-4 border-b border-gray-200 bg-gray-50 flex-shrink-0 space-y-3">
+          <p className="text-xs text-gray-500">添加或删除字段后，AI 对话指令和画像提取将自动更新。</p>
+          <div className="space-y-2">
+            {resolvedFields.map(({ key, label }) => (
+              <div key={key} className="flex items-center justify-between gap-2 text-sm">
+                <span className="font-mono text-gray-600 text-xs bg-gray-100 px-1.5 py-0.5 rounded">{key}</span>
+                <span className="flex-1 text-gray-700">{label}</span>
+                <button
+                  type="button"
+                  onClick={() => void deleteField(key)}
+                  disabled={savingDefinitions || resolvedFields.length <= 1}
+                  className="text-red-500 hover:text-red-700 text-xs disabled:text-gray-300 px-2 py-1"
+                  title={resolvedFields.length <= 1 ? '至少保留一个字段' : '删除'}
+                >
+                  删除
+                </button>
+              </div>
+            ))}
+          </div>
+          <div className="flex gap-2 items-start flex-wrap">
+            <input
+              type="text"
+              value={newFieldLabel}
+              onChange={(e) => setNewFieldLabel(e.target.value)}
+              placeholder="字段名称"
+              className="border border-gray-300 rounded px-2 py-1 text-sm flex-1 min-w-0 focus:outline-none focus:ring-1 focus:ring-blue-400"
+            />
+            <button
+              type="button"
+              onClick={() => void addField()}
+              disabled={savingDefinitions}
+              className="px-3 py-1 bg-blue-500 text-white rounded text-sm hover:bg-blue-600 disabled:bg-blue-300 whitespace-nowrap"
+            >
+              {savingDefinitions ? '保存中...' : '添加'}
+            </button>
+          </div>
+          {addFieldError && <p className="text-xs text-red-500">{addFieldError}</p>}
+        </div>
+      )}
 
       <div className="flex-1 overflow-y-auto px-6 py-4 min-h-0">
         {!hasFields ? (
@@ -159,7 +260,7 @@ export function ProfilePanel({
             {resolvedFields.map(({ key, label, placeholder, promptHint }) => {
               const value = profileData.values[key];
               const isHighlighted = highlightedFields.has(key);
-              const hasValue = value !== null && value !== '';
+              const hasValue = value !== null && value !== undefined && value !== '';
               const isEditing = editingField === key;
               const isSaving = savingField === key;
               const helperText = fieldErrors[key];

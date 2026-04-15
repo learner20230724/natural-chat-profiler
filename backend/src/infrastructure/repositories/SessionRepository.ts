@@ -87,6 +87,20 @@ export class SessionRepository {
     );
   }
 
+  /**
+   * Force the reasoner to trigger on the next incoming message by setting
+   * messageCountSinceReasoner to the given threshold value.
+   */
+  async forceReasonerOnNextMessage(id: string, threshold: number) {
+    await this.pool.query(
+      `UPDATE sessions
+       SET message_count_since_reasoner = ?,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [threshold, id]
+    );
+  }
+
   async incrementMessageCounter(id: string, executor: DatabaseExecutor = this.pool) {
     await executor.query(
       `UPDATE sessions
@@ -148,13 +162,17 @@ export class SessionRepository {
   }
 }
 
-function safeJsonParse(value: string | null | undefined): unknown | null {
+function safeJsonParse(value: string | unknown[] | null | undefined): unknown | null {
   if (!value) {
     return null;
   }
 
+  if (typeof value === 'object') {
+    return value;
+  }
+
   try {
-    return JSON.parse(value) as unknown;
+    return JSON.parse(value as string) as unknown;
   } catch {
     return null;
   }

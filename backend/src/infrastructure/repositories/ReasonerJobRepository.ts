@@ -47,7 +47,9 @@ export class ReasonerJobRepository {
 
   async hasRunningJob(sessionId: string) {
     const [rows] = await this.pool.query<mysql.RowDataPacket[]>(
-      `SELECT COUNT(*) AS count FROM reasoner_jobs WHERE session_id = ? AND status IN ('pending', 'running')`,
+      `SELECT COUNT(*) AS count FROM reasoner_jobs
+       WHERE session_id = ? AND status IN ('pending', 'running')
+         AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)`,
       [sessionId]
     );
     return Number(rows[0]?.count ?? 0) > 0;
